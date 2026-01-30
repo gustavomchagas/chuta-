@@ -14,8 +14,7 @@ model Player {
   isAdmin   Boolean  @default(false) @map("is_admin")
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
-
-  bets Bet[]
+  bets      Bet[]
 
   @@map("players")
 }
@@ -27,37 +26,27 @@ model Group {
   isActive        Boolean  @default(true) @map("is_active")
   createdAt       DateTime @default(now()) @map("created_at")
   updatedAt       DateTime @updatedAt @map("updated_at")
-
-  matches Match[]
+  matches         Match[]
 
   @@map("groups")
 }
 
 model Match {
-  id           String      @id @default(uuid())
-  groupId      String?     @map("group_id")
-  round        Int
-  homeTeam     String      @map("home_team")
-  awayTeam     String      @map("away_team")
-  matchDate    DateTime    @map("match_date")
-  homeScore    Int?        @map("home_score")
-  awayScore    Int?        @map("away_score")
-  status       MatchStatus @default(SCHEDULED)
-  createdAt    DateTime    @default(now()) @map("created_at")
-  updatedAt    DateTime    @updatedAt @map("updated_at")
-
-  group Group? @relation(fields: [groupId], references: [id], onDelete: Cascade)
-  bets  Bet[]
+  id        String      @id @default(uuid())
+  groupId   String?     @map("group_id")
+  round     Int
+  homeTeam  String      @map("home_team")
+  awayTeam  String      @map("away_team")
+  matchDate DateTime    @map("match_date")
+  homeScore Int?        @map("home_score")
+  awayScore Int?        @map("away_score")
+  status    MatchStatus @default(SCHEDULED)
+  createdAt DateTime    @default(now()) @map("created_at")
+  updatedAt DateTime    @updatedAt @map("updated_at")
+  bets      Bet[]
+  group     Group?      @relation(fields: [groupId], references: [id], onDelete: Cascade)
 
   @@map("matches")
-}
-
-enum MatchStatus {
-  SCHEDULED
-  LIVE
-  FINISHED
-  POSTPONED
-  CANCELLED
 }
 
 model Bet {
@@ -69,9 +58,8 @@ model Bet {
   points         Int?
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")
-
-  player Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
-  match  Match  @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  match          Match    @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  player         Player   @relation(fields: [playerId], references: [id], onDelete: Cascade)
 
   @@unique([playerId, matchId])
   @@map("bets")
@@ -79,9 +67,17 @@ model Bet {
 
 model Notification {
   id      String   @id @default(uuid())
-  type    String   // MORNING_GAMES, REMINDER, etc
+  type    String
   groupId String?  @map("group_id")
   sentAt  DateTime @map("sent_at")
-  
+
   @@map("notifications")
+}
+
+enum MatchStatus {
+  SCHEDULED
+  LIVE
+  FINISHED
+  POSTPONED
+  CANCELLED
 }

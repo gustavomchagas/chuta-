@@ -12,6 +12,12 @@ import { prisma } from "../lib/prisma";
 import { parseBets } from "../utils/betParser";
 import dayjs from "dayjs";
 import "dayjs/locale/pt-br";
+// Usa o scraper com Puppeteer em vez da API (que bloqueia requisições)
+import {
+  fetchBrasileiraoGames,
+  fetchLiveGames,
+  type GameData,
+} from "../services/sofascoreScraper";
 
 dayjs.locale("pt-br");
 
@@ -21,6 +27,47 @@ let sock: WASocket | null = null;
 
 // ID do grupo do bolão (será configurado)
 let BOLAO_GROUP_ID: string | null = null;
+
+/**
+ * Extrai o nome do jogador da mensagem, se houver.
+ * Se a primeira linha não contém placar (X x X), considera como nome.
+ *
+ * Exemplos:
+ * - "NEI\nFlamengo 2x1 Vasco" → { playerName: "NEI", betsText: "Flamengo 2x1 Vasco" }
+ * - "Flamengo 2x1 Vasco" → { playerName: null, betsText: "Flamengo 2x1 Vasco" }
+ */
+function extractPlayerNameFromMessage(text: string): {
+  playerName: string | null;
+  betsText: string;
+} {
+  const lines = text.trim().split("\n");
+
+  if (lines.length < 2) {
+    // Apenas uma linha, não tem nome separado
+    return { playerName: null, betsText: text };
+  }
+
+  const firstLine = lines[0].trim();
+
+  // Verifica se a primeira linha parece um placar (contém "x" entre números ou nomes de times)
+  // Padrões de placar: "2x1", "2 x 1", "Flamengo 2x1", "1) 2x1", etc.
+  const scorePattern = /\d+\s*x\s*\d+/i;
+
+  if (scorePattern.test(firstLine)) {
+    // Primeira linha é um placar, não tem nome
+    return { playerName: null, betsText: text };
+  }
+
+  // Verifica se a primeira linha é curta e não contém números (provavelmente um nome)
+  // Nomes geralmente têm menos de 30 caracteres e não contêm dígitos de placar
+  if (firstLine.length <= 30 && !scorePattern.test(firstLine)) {
+    // Considera a primeira linha como nome
+    const betsText = lines.slice(1).join("\n");
+    return { playerName: firstLine, betsText };
+  }
+
+  return { playerName: null, betsText: text };
+}
 
 /**
  * Inicializa o bot do WhatsApp
@@ -65,6 +112,7 @@ export async function initBot() {
       console.log("   !jogos              - Envia jogos da rodada atual");
       console.log("   !ranking            - Mostra ranking atual");
       console.log("   !faltam             - Mostra quem ainda não palpitou");
+      console.log("   !sync               - Sincroniza jogos do SofaScore");
       console.log("   !ajuda              - Lista de comandos");
 
       // Carrega configuração do grupo
@@ -72,6 +120,9 @@ export async function initBot() {
 
       // Inicia scheduler de notificações matinais
       startMorningNotificationScheduler();
+
+      // Inicia scheduler de sincronização SofaScore
+      startSofaScoreSchedulers();
     }
   });
 
@@ -232,6 +283,20 @@ async function handleCommand(
       await sendUserBets(chatId, senderId);
       break;
 
+    case "!sync":
+    case "!sincronizar":
+      // Força sincronização com SofaScore
+      if (sock) {
+        await sock.sendMessage(chatId, {
+          text: "🔄 Sincronizando jogos do Brasileirão...",
+        });
+        const result = await syncTodayGames();
+        await sock.sendMessage(chatId, {
+          text: `✅ Sincronização completa!\n\n📊 ${result.added} jogos novos\n✏️ ${result.updated} atualizados`,
+        });
+      }
+      break;
+
     case "!ajuda":
     case "!help":
     case "!comandos":
@@ -250,6 +315,9 @@ async function handlePossibleBet(
   msg: proto.IWebMessageInfo,
 ) {
   if (!sock) return;
+
+  // Verifica se a mensagem começa com um nome (palpite em nome de outra pessoa)
+  const { playerName, betsText } = extractPlayerNameFromMessage(text);
 
   // Busca jogos da rodada atual (agendados ou do dia)
   const today = dayjs().startOf("day").toDate();
@@ -273,26 +341,51 @@ async function handlePossibleBet(
     awayTeam: m.awayTeam,
   }));
 
-  // Tenta parsear os palpites
-  const parseResult = parseBets(text, roundMatches);
+  // Tenta parsear os palpites (usa o texto sem o nome, se houver)
+  const parseResult = parseBets(betsText, roundMatches);
 
   if (!parseResult.success) return; // Não parece ser um palpite
 
-  // Busca ou cria o jogador pelo telefone
-  let player = await prisma.player.findUnique({
-    where: { phone: senderPhone },
-  });
+  // Determina o jogador
+  let player;
 
-  if (!player) {
-    // Tenta pegar o nome do contato
-    const pushName = msg.pushName || `Jogador ${senderPhone.slice(-4)}`;
-    player = await prisma.player.create({
-      data: {
-        phone: senderPhone,
-        name: pushName,
+  if (playerName) {
+    // Palpite em nome de outra pessoa - busca ou cria pelo nome
+    player = await prisma.player.findFirst({
+      where: {
+        name: {
+          equals: playerName,
+          mode: "insensitive", // Case insensitive
+        },
       },
     });
-    console.log(`👤 Novo jogador cadastrado: ${player.name}`);
+
+    if (!player) {
+      // Cria novo jogador com esse nome (sem telefone, pois não sabemos)
+      player = await prisma.player.create({
+        data: {
+          phone: `ext_${Date.now()}`, // Telefone temporário único
+          name: playerName,
+        },
+      });
+      console.log(`👤 Novo jogador cadastrado (por nome): ${player.name}`);
+    }
+  } else {
+    // Palpite normal - busca ou cria pelo telefone
+    player = await prisma.player.findUnique({
+      where: { phone: senderPhone },
+    });
+
+    if (!player) {
+      const pushName = msg.pushName || `Jogador ${senderPhone.slice(-4)}`;
+      player = await prisma.player.create({
+        data: {
+          phone: senderPhone,
+          name: pushName,
+        },
+      });
+      console.log(`👤 Novo jogador cadastrado: ${player.name}`);
+    }
   }
 
   // Salva os palpites
@@ -850,10 +943,14 @@ async function sendHelp(chatId: string) {
     `*!faltam* - Ver quem falta palpitar\n` +
     `*!palpites* - Ver todos os palpites\n` +
     `*!meus* - Ver seus palpites\n` +
+    `*!sync* - Sincroniza jogos do SofaScore\n` +
     `*!ajuda* - Ver esta mensagem\n\n` +
     `📝 *Para palpitar:*\n` +
     `Envie todos os palpites de uma vez!\n` +
-    `Ex: \`Flamengo 2x1 Vasco\``;
+    `Ex: \`Flamengo 2x1 Vasco\`\n\n` +
+    `👥 *Palpitar em nome de outra pessoa:*\n` +
+    `NOME DA PESSOA\n` +
+    `Flamengo 2x1 Vasco`;
 
   await sock.sendMessage(chatId, { text: message });
 }
@@ -1205,4 +1302,363 @@ async function sendMorningNotification() {
   });
 
   console.log(`✅ Notificação matinal enviada para ${BOLAO_GROUP_ID}`);
+}
+// ========================================
+// INTEGRAÇÃO SOFASCORE - SINCRONIZAÇÃO AUTOMÁTICA
+// ========================================
+
+let sofascoreSchedulerRunning = false;
+let liveUpdateSchedulerRunning = false;
+
+/**
+ * Inicia os schedulers de sincronização com SofaScore
+ */
+export function startSofaScoreSchedulers() {
+  if (sofascoreSchedulerRunning) return;
+  sofascoreSchedulerRunning = true;
+
+  console.log("🌐 Scheduler SofaScore ativado:");
+  console.log("   • Busca jogos do dia às 6h da manhã");
+  console.log("   • Atualiza resultados em tempo real a cada 2 minutos");
+
+  // Scheduler para buscar jogos do dia (às 6h)
+  setInterval(async () => {
+    const now = dayjs();
+    if (now.hour() === 6 && now.minute() === 0) {
+      await syncTodayGames();
+    }
+  }, 60000);
+
+  // Scheduler para atualizar resultados em tempo real (a cada 2 minutos)
+  setInterval(async () => {
+    await updateLiveResults();
+  }, 120000); // 2 minutos
+
+  // Sincroniza imediatamente ao iniciar
+  syncTodayGames();
+}
+
+/**
+ * Sincroniza jogos do dia do Brasileirão com o banco de dados
+ */
+export async function syncTodayGames(): Promise<{
+  added: number;
+  updated: number;
+}> {
+  console.log("\n🔄 Sincronizando jogos do Brasileirão...");
+
+  try {
+    const today = new Date();
+    const games = await fetchBrasileiraoGames(today);
+
+    if (games.length === 0) {
+      console.log("📭 Nenhum jogo do Brasileirão encontrado para hoje");
+      return { added: 0, updated: 0 };
+    }
+
+    // Busca o grupo ativo
+    const group = await prisma.group.findFirst({
+      where: { isActive: true },
+    });
+
+    if (!group) {
+      console.log("⚠️ Nenhum grupo configurado para cadastrar jogos");
+      return { added: 0, updated: 0 };
+    }
+
+    let added = 0;
+    let updated = 0;
+
+    for (const game of games) {
+      // Verifica se já existe um jogo com mesmos times, data e rodada
+      const existing = await prisma.match.findFirst({
+        where: {
+          homeTeam: game.homeTeam,
+          awayTeam: game.awayTeam,
+          round: game.round,
+        },
+      });
+
+      if (existing) {
+        // Atualiza se necessário (status ou placar)
+        if (
+          existing.status !== game.status ||
+          existing.homeScore !== game.homeScore ||
+          existing.awayScore !== game.awayScore
+        ) {
+          await prisma.match.update({
+            where: { id: existing.id },
+            data: {
+              status: game.status,
+              homeScore: game.homeScore,
+              awayScore: game.awayScore,
+            },
+          });
+          updated++;
+          console.log(
+            `   ✏️ Atualizado: ${game.homeTeam} vs ${game.awayTeam} (${game.status})`,
+          );
+        }
+      } else {
+        // Cria novo jogo
+        await prisma.match.create({
+          data: {
+            groupId: group.id,
+            homeTeam: game.homeTeam,
+            awayTeam: game.awayTeam,
+            matchDate: game.matchDate,
+            round: game.round,
+            status: game.status,
+            homeScore: game.homeScore,
+            awayScore: game.awayScore,
+          },
+        });
+        added++;
+        console.log(
+          `   ✅ Cadastrado: ${game.homeTeam} vs ${game.awayTeam} - Rodada ${game.round}`,
+        );
+      }
+    }
+
+    console.log(
+      `📊 Sincronização concluída: ${added} novos, ${updated} atualizados`,
+    );
+    return { added, updated };
+  } catch (error) {
+    console.error("❌ Erro ao sincronizar jogos:", error);
+    return { added: 0, updated: 0 };
+  }
+}
+
+/**
+ * Atualiza resultados de jogos ao vivo
+ */
+async function updateLiveResults() {
+  try {
+    // Busca jogos ao vivo do Brasileirão
+    const liveGames = await fetchLiveGames();
+
+    if (liveGames.length === 0) {
+      return; // Sem jogos ao vivo, nada a fazer
+    }
+
+    console.log(`⚽ ${liveGames.length} jogo(s) ao vivo do Brasileirão`);
+
+    for (const game of liveGames) {
+      // Busca o jogo correspondente no banco
+      const match = await prisma.match.findFirst({
+        where: {
+          homeTeam: game.homeTeam,
+          awayTeam: game.awayTeam,
+          round: game.round,
+        },
+      });
+
+      if (
+        match &&
+        (match.homeScore !== game.homeScore ||
+          match.awayScore !== game.awayScore)
+      ) {
+        // Atualiza o placar
+        await prisma.match.update({
+          where: { id: match.id },
+          data: {
+            status: "LIVE" as any,
+            homeScore: game.homeScore,
+            awayScore: game.awayScore,
+          },
+        });
+
+        console.log(
+          `   🔴 ${game.homeTeam} ${game.homeScore} x ${game.awayScore} ${game.awayTeam} (AO VIVO)`,
+        );
+
+        // Se tiver grupo configurado, envia atualização de gol
+        if (
+          sock &&
+          BOLAO_GROUP_ID &&
+          match.homeScore !== null &&
+          match.awayScore !== null
+        ) {
+          // Detecta se houve gol (mudança de placar)
+          const oldTotal = (match.homeScore || 0) + (match.awayScore || 0);
+          const newTotal = (game.homeScore || 0) + (game.awayScore || 0);
+
+          if (newTotal > oldTotal) {
+            await sendGoalNotification(game);
+          }
+        }
+      }
+    }
+
+    // Busca jogos que terminaram (estavam LIVE e agora estão FINISHED)
+    await checkFinishedGames();
+  } catch (error) {
+    console.error("❌ Erro ao atualizar resultados:", error);
+  }
+}
+
+/**
+ * Verifica jogos que terminaram e calcula pontuações
+ */
+async function checkFinishedGames() {
+  try {
+    // Busca jogos ao vivo no banco
+    const liveMatches = await prisma.match.findMany({
+      where: { status: "LIVE" },
+    });
+
+    for (const match of liveMatches) {
+      // Busca o jogo de hoje no SofaScore pelo time
+      const today = new Date();
+      const games = await fetchBrasileiraoGames(today);
+
+      const sofaGame = games.find(
+        (g) => g.homeTeam === match.homeTeam && g.awayTeam === match.awayTeam,
+      );
+
+      if (sofaGame && sofaGame.status === "FINISHED") {
+        console.log(
+          `🏁 Jogo finalizado: ${match.homeTeam} ${sofaGame.homeScore} x ${sofaGame.awayScore} ${match.awayTeam}`,
+        );
+
+        // Atualiza o jogo como finalizado
+        await prisma.match.update({
+          where: { id: match.id },
+          data: {
+            status: "FINISHED",
+            homeScore: sofaGame.homeScore,
+            awayScore: sofaGame.awayScore,
+          },
+        });
+
+        // Calcula pontos dos palpites
+        await calculateBetPoints(
+          match.id,
+          sofaGame.homeScore!,
+          sofaGame.awayScore!,
+        );
+
+        // Envia notificação de resultado final
+        if (sock && BOLAO_GROUP_ID) {
+          await sendFinalResultNotification(match, sofaGame);
+        }
+      }
+    }
+  } catch (error) {
+    console.error("❌ Erro ao verificar jogos finalizados:", error);
+  }
+}
+
+/**
+ * Calcula pontos dos palpites de um jogo
+ */
+async function calculateBetPoints(
+  matchId: string,
+  homeScore: number,
+  awayScore: number,
+) {
+  const bets = await prisma.bet.findMany({
+    where: { matchId },
+  });
+
+  for (const bet of bets) {
+    let points = 0;
+
+    // 2 pontos = placar exato
+    if (bet.homeScoreGuess === homeScore && bet.awayScoreGuess === awayScore) {
+      points = 2;
+    }
+    // 1 ponto = acertou resultado (vitória/empate/derrota)
+    else {
+      const realResult =
+        homeScore > awayScore ? "H" : homeScore < awayScore ? "A" : "D";
+      const guessResult =
+        bet.homeScoreGuess > bet.awayScoreGuess
+          ? "H"
+          : bet.homeScoreGuess < bet.awayScoreGuess
+            ? "A"
+            : "D";
+
+      if (realResult === guessResult) {
+        points = 1;
+      }
+    }
+
+    await prisma.bet.update({
+      where: { id: bet.id },
+      data: { points },
+    });
+  }
+
+  console.log(`   📊 Pontos calculados para ${bets.length} palpites`);
+}
+
+/**
+ * Envia notificação de gol
+ */
+async function sendGoalNotification(game: GameData) {
+  if (!sock || !BOLAO_GROUP_ID) return;
+
+  const message =
+    `⚽ *GOOOOL!*\n\n` +
+    `🏟️ ${game.homeTeam} *${game.homeScore}* x *${game.awayScore}* ${game.awayTeam}\n\n` +
+    `_Jogo ao vivo - Rodada ${game.round}_`;
+
+  await sock.sendMessage(BOLAO_GROUP_ID, { text: message });
+}
+
+/**
+ * Envia notificação de resultado final com parcial do ranking
+ */
+async function sendFinalResultNotification(
+  match: { id: string; homeTeam: string; awayTeam: string; round: number },
+  game: GameData,
+) {
+  if (!sock || !BOLAO_GROUP_ID) return;
+
+  // Busca os palpites deste jogo com pontuação
+  const bets = await prisma.bet.findMany({
+    where: { matchId: match.id },
+    include: { player: true },
+    orderBy: { points: "desc" },
+  });
+
+  let message = `🏁 *FIM DE JOGO!*\n\n`;
+  message += `🏟️ ${game.homeTeam} *${game.homeScore}* x *${game.awayScore}* ${game.awayTeam}\n\n`;
+
+  if (bets.length > 0) {
+    message += `📊 *Pontuação neste jogo:*\n`;
+
+    const exactScores = bets.filter((b) => b.points === 2);
+    const correctResults = bets.filter((b) => b.points === 1);
+    const wrong = bets.filter((b) => b.points === 0);
+
+    if (exactScores.length > 0) {
+      message += `\n🎯 *Placar exato (2pts):*\n`;
+      message += exactScores.map((b) => `• ${b.player.name}`).join("\n");
+    }
+
+    if (correctResults.length > 0) {
+      message += `\n\n✅ *Resultado certo (1pt):*\n`;
+      message += correctResults.map((b) => `• ${b.player.name}`).join("\n");
+    }
+
+    if (wrong.length > 0) {
+      message += `\n\n❌ *Erraram:*\n`;
+      message += wrong.map((b) => `• ${b.player.name}`).join("\n");
+    }
+  }
+
+  message += `\n\n_Digite !rodada para ver a parcial da rodada ${match.round}_`;
+
+  await sock.sendMessage(BOLAO_GROUP_ID, { text: message });
+}
+
+/**
+ * Comando para forçar sincronização (admin)
+ */
+export async function forceSync(): Promise<string> {
+  const result = await syncTodayGames();
+  return `Sincronização completa: ${result.added} novos jogos, ${result.updated} atualizados`;
 }

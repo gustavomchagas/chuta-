@@ -5,6 +5,11 @@ import fs from "fs";
 import { prisma } from "./lib/prisma";
 import dayjs from "dayjs";
 import "dayjs/locale/pt-br";
+// Usa o scraper com Puppeteer em vez da API (que bloqueia requisições)
+import {
+  fetchBrasileiraoGames,
+  testScraping,
+} from "./services/sofascoreScraper";
 
 dayjs.locale("pt-br");
 
@@ -278,6 +283,97 @@ app.delete("/api/games/:id", async (request) => {
   const { id } = request.params as { id: string };
   await prisma.match.delete({ where: { id } });
   return { success: true };
+});
+
+// ============================================
+// INTEGRAÇÃO SOFASCORE
+// ============================================
+
+// Sincroniza jogos do dia do SofaScore
+app.post("/api/sync/today", async () => {
+  try {
+    const today = new Date();
+    const games = await fetchBrasileiraoGames(today);
+
+    if (games.length === 0) {
+      return {
+        success: true,
+        message: "Nenhum jogo do Brasileirão hoje",
+        added: 0,
+        updated: 0,
+      };
+    }
+
+    // Busca o grupo ativo
+    const group = await prisma.group.findFirst({
+      where: { isActive: true },
+    });
+
+    let added = 0;
+    let updated = 0;
+
+    for (const game of games) {
+      // Verifica se já existe um jogo com mesmos times e rodada
+      const existing = await prisma.match.findFirst({
+        where: {
+          homeTeam: game.homeTeam,
+          awayTeam: game.awayTeam,
+          round: game.round,
+        },
+      });
+
+      if (existing) {
+        // Atualiza se necessário
+        if (
+          existing.status !== game.status ||
+          existing.homeScore !== game.homeScore ||
+          existing.awayScore !== game.awayScore
+        ) {
+          await prisma.match.update({
+            where: { id: existing.id },
+            data: {
+              status: game.status,
+              homeScore: game.homeScore,
+              awayScore: game.awayScore,
+            },
+          });
+          updated++;
+        }
+      } else {
+        // Cria novo jogo
+        await prisma.match.create({
+          data: {
+            groupId: group?.id || null,
+            homeTeam: game.homeTeam,
+            awayTeam: game.awayTeam,
+            matchDate: game.matchDate,
+            round: game.round,
+            status: game.status,
+            homeScore: game.homeScore,
+            awayScore: game.awayScore,
+          },
+        });
+        added++;
+      }
+    }
+
+    return {
+      success: true,
+      message: `Sincronização completa`,
+      added,
+      updated,
+      total: games.length,
+    };
+  } catch (error) {
+    console.error("Erro ao sincronizar:", error);
+    return { success: false, error: String(error) };
+  }
+});
+
+// Testa se o scraping está funcionando
+app.get("/api/sofascore/test", async () => {
+  const result = await testScraping();
+  return result;
 });
 
 // Lista todos os jogadores
