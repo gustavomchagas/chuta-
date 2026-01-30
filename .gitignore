@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+coverage/
+.prisma/
+
+# WhatsApp session data
+whatsapp-session/
+auth_info_baileys/
