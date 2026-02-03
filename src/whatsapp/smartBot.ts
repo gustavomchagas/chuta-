@@ -16,6 +16,7 @@ import "dayjs/locale/pt-br";
 import {
   fetchBrasileiraoGames,
   fetchLiveGames,
+  fetchRoundGames,
   type GameData,
 } from "../services/sofascoreScraper";
 
@@ -208,6 +209,14 @@ async function handleCommand(
 
   switch (cmd) {
     case "!config":
+    case "!configuracao":
+    case "!regras":
+    case "!info":
+      await sendBotInfo(chatId);
+      break;
+
+    case "!setupgrupo":
+      // Comando admin para configurar o grupo (mantido separado)
       if (chatId.endsWith("@g.us")) {
         // Configura o grupo atual
         BOLAO_GROUP_ID = chatId;
@@ -231,9 +240,30 @@ async function handleCommand(
           });
         }
 
+        // Busca metadados do grupo para mencionar todos
+        const groupMetadata = await sock.groupMetadata(chatId);
+        const participants = groupMetadata.participants.map((p) => p.id);
+
+        // Monta mensagem com menção a todos
+        const mentions = participants;
+        const setupMessage =
+          `✅ *GRUPO CONFIGURADO COM SUCESSO!* ✅\n\n` +
+          `Este grupo agora é o grupo oficial do *BOLÃO BRASILEIRÃO 2026*! 🏆⚽\n\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n\n` +
+          `👥 *ATENÇÃO @todos*\n\n` +
+          `O bot está ativo e pronto para receber seus palpites!\n\n` +
+          `🎯 Digite *!config* para ver todas as regras\n` +
+          `🎮 Digite *!ajuda* para ver todos os comandos\n\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n\n` +
+          `🤖 *BOA SORTE A TODOS!* ⚽`;
+
         await sock.sendMessage(chatId, {
-          text: "✅ Este grupo foi configurado como o grupo do bolão!",
+          text: setupMessage,
+          mentions: mentions,
         });
+
+        // Envia as regras completas logo em seguida
+        await sendBotInfo(chatId);
       }
       break;
 
@@ -294,6 +324,67 @@ async function handleCommand(
         await sock.sendMessage(chatId, {
           text: `✅ Sincronização completa!\n\n📊 ${result.added} jogos novos\n✏️ ${result.updated} atualizados`,
         });
+      }
+      break;
+
+    case "!syncrodada":
+    case "!sincronizarrodada":
+      // Sincroniza rodada específica
+      if (sock) {
+        const roundNum = arg ? parseInt(arg) : await getNextRound();
+        if (!isNaN(roundNum) && roundNum > 0) {
+          await sock.sendMessage(chatId, {
+            text: `🔄 Sincronizando rodada ${roundNum}...`,
+          });
+          const result = await syncRoundGames(roundNum);
+          await sock.sendMessage(chatId, {
+            text: `✅ Rodada ${roundNum} sincronizada!\n\n📊 ${result.added} jogos novos\n✏️ ${result.updated} atualizados`,
+          });
+        } else {
+          await sock.sendMessage(chatId, {
+            text: "❌ Número de rodada inválido. Use: !syncrodada 2",
+          });
+        }
+      }
+      break;
+
+    case "!proxima":
+    case "!proximarodada":
+      // Sincroniza próxima rodada automaticamente
+      if (sock) {
+        await sock.sendMessage(chatId, {
+          text: "🔄 Buscando próxima rodada...",
+        });
+        const result = await syncNextRound();
+        if (result.round > 0) {
+          await sock.sendMessage(chatId, {
+            text: `✅ Rodada ${result.round} detectada e sincronizada!\n\n📊 ${result.added} jogos cadastrados\n✏️ ${result.updated} atualizados\n\n🎯 Use !jogos para ver os jogos`,
+          });
+        } else {
+          await sock.sendMessage(chatId, {
+            text: "📭 Nenhuma rodada nova encontrada no momento.",
+          });
+        }
+      }
+      break;
+
+    case "!verificar":
+    case "!verificaradiados":
+      // Verifica jogos adiados/cancelados
+      if (sock) {
+        await sock.sendMessage(chatId, {
+          text: "🔍 Verificando jogos adiados e remarcados...",
+        });
+        const result = await checkPostponedGames();
+        if (result.postponed === 0 && result.rescheduled === 0) {
+          await sock.sendMessage(chatId, {
+            text: "✅ Nenhuma alteração detectada. Todos os jogos mantêm seus horários!",
+          });
+        } else {
+          await sock.sendMessage(chatId, {
+            text: `📊 Verificação concluída!\n\n⚠️ ${result.postponed} jogo(s) adiado(s)/cancelado(s)\n✅ ${result.rescheduled} jogo(s) remarcado(s)`,
+          });
+        }
       }
       break;
 
@@ -391,6 +482,7 @@ async function handlePossibleBet(
   // Salva os palpites
   const savedBets: string[] = [];
   const errors: string[] = [];
+  const alreadyBet: string[] = [];
 
   for (const bet of parseResult.bets) {
     try {
@@ -403,19 +495,27 @@ async function handlePossibleBet(
         continue;
       }
 
-      // Upsert do palpite
-      await prisma.bet.upsert({
+      // Verifica se já existe palpite para este jogo
+      const existingBet = await prisma.bet.findUnique({
         where: {
           playerId_matchId: {
             playerId: player.id,
             matchId: bet.matchId,
           },
         },
-        update: {
-          homeScoreGuess: bet.homeScore,
-          awayScoreGuess: bet.awayScore,
-        },
-        create: {
+      });
+
+      if (existingBet) {
+        // Palpite já existe - NÃO PODE ALTERAR
+        alreadyBet.push(
+          `${bet.matchNumber}) ${bet.homeTeam} x ${bet.awayTeam} (já palpitado: ${existingBet.homeScoreGuess}x${existingBet.awayScoreGuess})`,
+        );
+        continue;
+      }
+
+      // Cria novo palpite (apenas create, sem update)
+      await prisma.bet.create({
+        data: {
           playerId: player.id,
           matchId: bet.matchId,
           homeScoreGuess: bet.homeScore,
@@ -432,12 +532,25 @@ async function handlePossibleBet(
   }
 
   // Resposta de confirmação
-  if (savedBets.length > 0) {
-    let response = `✅ *Palpites de ${player.name} registrados!*\n\n`;
-    response += savedBets.join("\n");
+  if (savedBets.length > 0 || alreadyBet.length > 0 || errors.length > 0) {
+    let response = "";
+
+    if (savedBets.length > 0) {
+      response += `✅ *Palpites de ${player.name} registrados!*\n\n`;
+      response += savedBets.join("\n");
+      response += `\n\n⚠️ *ATENÇÃO: Palpites não podem ser alterados!*`;
+    }
+
+    if (alreadyBet.length > 0) {
+      if (response) response += "\n\n";
+      response += `🚫 *Palpites já registrados (não alterados):*\n`;
+      response += alreadyBet.join("\n");
+      response += `\n\n_Palpites são definitivos e não podem ser modificados._`;
+    }
 
     if (errors.length > 0) {
-      response += `\n\n⚠️ *Não registrados:*\n${errors.join("\n")}`;
+      if (response) response += "\n\n";
+      response += `⚠️ *Não registrados:*\n${errors.join("\n")}`;
     }
 
     if (parseResult.suggestions.length > 0) {
@@ -929,6 +1042,64 @@ async function sendUserBets(chatId: string, senderId: string) {
 }
 
 /**
+ * Envia informações completas sobre o bot e regras do bolão
+ */
+async function sendBotInfo(chatId: string) {
+  if (!sock) return;
+
+  const message =
+    `🤖 *CHUTAÍ - BOT DO BOLÃO BRASILEIRÃO 2026*\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `📋 *REGRAS DO BOLÃO*\n\n` +
+    `✅ *Pontuação:*\n` +
+    `• Placar EXATO: *2 pontos*\n` +
+    `• Vencedor/Empate CERTO: *1 ponto*\n` +
+    `• Placar ERRADO: *0 pontos*\n\n` +
+    `🚫 *ATENÇÃO - Palpites IMUTÁVEIS:*\n` +
+    `• Uma vez enviado, o palpite *NÃO PODE* ser alterado\n` +
+    `• Confira bem antes de enviar!\n` +
+    `• Tentativas de enviar novamente serão rejeitadas\n\n` +
+    `⏰ *Prazo para Palpitar:*\n` +
+    `• Palpites só valem se enviados *ANTES* do jogo começar\n` +
+    `• Após o início, o jogo não aceita mais palpites\n\n` +
+    `👥 *Palpitar por Outra Pessoa:*\n` +
+    `• Digite o NOME na primeira linha, depois os palpites\n` +
+    `• SEMPRE use o MESMO nome para a mesma pessoa\n` +
+    `• Maiúsculas/minúsculas são ignoradas (NEI = Nei = nei)\n` +
+    `• Mas "NEI" ≠ "CLAUDINEI" (são jogadores diferentes!)\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `🤖 *FUNCIONAMENTO DO BOT*\n\n` +
+    `📍 *Notificações Automáticas:*\n` +
+    `• 08h - Bom dia com jogos do dia\n` +
+    `• 08h/11h/14h/17h/20h - Lembretes periódicos\n` +
+    `• 1h antes - Última chamada!\n\n` +
+    `⚽ *Atualizações em Tempo Real:*\n` +
+    `• Gols são notificados automaticamente\n` +
+    `• Resultados atualizados a cada 2 minutos\n` +
+    `• Pontuação calculada ao final de cada jogo\n\n` +
+    `📊 *Sincronização com SofaScore:*\n` +
+    `• 06h - Sincroniza jogos do dia\n` +
+    `• 10h - Verifica jogos adiados/remarcados\n` +
+    `• Segunda 02h - Detecta nova rodada\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `📝 *COMO PALPITAR*\n\n` +
+    `Envie seus palpites no formato:\n` +
+    `\`Time Casa X x Y Time Fora\`\n\n` +
+    `*Exemplo:*\n` +
+    `Flamengo 2x1 Vasco\n` +
+    `Palmeiras 3x0 Corinthians\n` +
+    `São Paulo 1x1 Santos\n\n` +
+    `💡 *Dica:* Envie todos os palpites de uma vez!\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `⚙️ *COMANDOS DISPONÍVEIS*\n\n` +
+    `Use *!ajuda* para ver lista completa de comandos\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `🎯 *BOA SORTE E BONS PALPITES!* ⚽`;
+
+  await sock.sendMessage(chatId, { text: message });
+}
+
+/**
  * Envia a lista de comandos
  */
 async function sendHelp(chatId: string) {
@@ -936,19 +1107,24 @@ async function sendHelp(chatId: string) {
 
   const message =
     `🤖 *COMANDOS DO CHUTAÍ*\n\n` +
+    `*📋 Palpites e Jogos:*\n` +
     `*!jogos* - Ver jogos da rodada\n` +
-    `*!ranking* - Ranking geral do bolão\n` +
-    `*!ranking X* - Ranking da rodada X\n` +
-    `*!rodada* - Status e parcial da rodada atual\n` +
-    `*!faltam* - Ver quem falta palpitar\n` +
     `*!palpites* - Ver todos os palpites\n` +
     `*!meus* - Ver seus palpites\n` +
-    `*!sync* - Sincroniza jogos do SofaScore\n` +
-    `*!ajuda* - Ver esta mensagem\n\n` +
-    `📝 *Para palpitar:*\n` +
+    `*!faltam* - Ver quem falta palpitar\n\n` +
+    `*🏆 Rankings:*\n` +
+    `*!ranking* - Ranking geral do bolão\n` +
+    `*!ranking X* - Ranking da rodada X\n` +
+    `*!rodada* - Status e parcial da rodada atual\n\n` +
+    `*🔄 Sincronização:*\n` +
+    `*!sync* - Sincroniza jogos de hoje\n` +
+    `*!syncrodada X* - Sincroniza rodada X\n` +
+    `*!proxima* - Busca e cadastra próxima rodada\n` +
+    `*!verificar* - Verifica jogos adiados/remarcados\n\n` +
+    `*📝 Para palpitar:*\n` +
     `Envie todos os palpites de uma vez!\n` +
     `Ex: \`Flamengo 2x1 Vasco\`\n\n` +
-    `👥 *Palpitar em nome de outra pessoa:*\n` +
+    `*👥 Palpitar em nome de outra pessoa:*\n` +
     `NOME DA PESSOA\n` +
     `Flamengo 2x1 Vasco`;
 
@@ -1091,7 +1267,8 @@ async function sendFinalReminder(round: number) {
   message += `🏟️ ${firstMatch.homeTeam} x ${firstMatch.awayTeam}\n\n`;
   message += `📋 *Ainda faltam palpitar:*\n`;
   message += pendingPlayers.map((p) => `• ${p.name}`).join("\n");
-  message += `\n\n⚠️ _Corram que ainda dá tempo!_`;
+  message += `\n\n⚠️ _Corram que ainda dá tempo!_\n`;
+  message += `⚠️ _Lembre-se: depois de enviado, não é possível alterar!_`;
 
   await sock.sendMessage(BOLAO_GROUP_ID, { text: message });
 
@@ -1161,7 +1338,8 @@ async function sendReminderIfNeeded() {
   message += `${firstMatch.homeTeam} x ${firstMatch.awayTeam}\n\n`;
   message += `📋 *Ainda faltam palpitar:*\n`;
   message += pendingPlayers.map((p) => `• ${p.name}`).join("\n");
-  message += `\n\n📝 _Enviem seus palpites!_`;
+  message += `\n\n📝 _Enviem seus palpites!_\n`;
+  message += `⚠️ _Lembre-se: palpites não podem ser alterados depois de enviados._`;
 
   await sock.sendMessage(BOLAO_GROUP_ID, { text: message });
 
@@ -1278,6 +1456,8 @@ async function sendMorningNotification() {
 
   message += `\n📝 *Enviem seus palpites!*\n`;
   message += `_Lembrando: palpite só vale se enviado ANTES do jogo começar!_\n\n`;
+  message += `⚠️ *ATENÇÃO: Uma vez enviado, o palpite NÃO PODE ser alterado!*\n`;
+  message += `_Confira bem antes de enviar._\n\n`;
 
   // Gera exemplo com os times do dia
   message += `*Exemplo de palpite:*\n`;
@@ -1319,6 +1499,8 @@ export function startSofaScoreSchedulers() {
 
   console.log("🌐 Scheduler SofaScore ativado:");
   console.log("   • Busca jogos do dia às 6h da manhã");
+  console.log("   • Verifica nova rodada às 2h da manhã (segunda-feira)");
+  console.log("   • Verifica jogos adiados às 10h da manhã");
   console.log("   • Atualiza resultados em tempo real a cada 2 minutos");
 
   // Scheduler para buscar jogos do dia (às 6h)
@@ -1326,6 +1508,25 @@ export function startSofaScoreSchedulers() {
     const now = dayjs();
     if (now.hour() === 6 && now.minute() === 0) {
       await syncTodayGames();
+    }
+  }, 60000);
+
+  // Scheduler para detectar nova rodada (às 2h da manhã, toda segunda-feira)
+  setInterval(async () => {
+    const now = dayjs();
+    if (now.hour() === 2 && now.minute() === 0 && now.day() === 1) {
+      // Segunda-feira às 2h
+      console.log("🔍 Verificação automática de nova rodada (segunda-feira)");
+      await syncNextRound();
+    }
+  }, 60000);
+
+  // Scheduler para verificar jogos adiados/remarcados (às 10h)
+  setInterval(async () => {
+    const now = dayjs();
+    if (now.hour() === 10 && now.minute() === 0) {
+      console.log("🔍 Verificação automática de jogos adiados");
+      await checkPostponedGames();
     }
   }, 60000);
 
@@ -1427,6 +1628,304 @@ export async function syncTodayGames(): Promise<{
   } catch (error) {
     console.error("❌ Erro ao sincronizar jogos:", error);
     return { added: 0, updated: 0 };
+  }
+}
+
+/**
+ * Sincroniza todos os jogos de uma rodada específica
+ */
+export async function syncRoundGames(round: number): Promise<{
+  added: number;
+  updated: number;
+}> {
+  console.log(`\n🔄 Sincronizando rodada ${round}...`);
+
+  try {
+    const games = await fetchRoundGames(round);
+
+    if (games.length === 0) {
+      console.log(`📭 Nenhum jogo encontrado para a rodada ${round}`);
+      return { added: 0, updated: 0 };
+    }
+
+    // Busca o grupo ativo
+    const group = await prisma.group.findFirst({
+      where: { isActive: true },
+    });
+
+    if (!group) {
+      console.log("⚠️ Nenhum grupo configurado para cadastrar jogos");
+      return { added: 0, updated: 0 };
+    }
+
+    let added = 0;
+    let updated = 0;
+
+    for (const game of games) {
+      // Verifica se já existe um jogo com mesmos times e rodada
+      const existing = await prisma.match.findFirst({
+        where: {
+          homeTeam: game.homeTeam,
+          awayTeam: game.awayTeam,
+          round: game.round,
+        },
+      });
+
+      if (existing) {
+        // Atualiza se necessário
+        const needsUpdate =
+          existing.status !== game.status ||
+          existing.homeScore !== game.homeScore ||
+          existing.awayScore !== game.awayScore ||
+          Math.abs(existing.matchDate.getTime() - game.matchDate.getTime()) >
+            60000; // Diferença de mais de 1 minuto
+
+        if (needsUpdate) {
+          await prisma.match.update({
+            where: { id: existing.id },
+            data: {
+              matchDate: game.matchDate,
+              status: game.status,
+              homeScore: game.homeScore,
+              awayScore: game.awayScore,
+            },
+          });
+          updated++;
+          console.log(
+            `   ✏️ Atualizado: ${game.homeTeam} vs ${game.awayTeam} (${game.status})`,
+          );
+        }
+      } else {
+        // Cria novo jogo
+        await prisma.match.create({
+          data: {
+            groupId: group.id,
+            homeTeam: game.homeTeam,
+            awayTeam: game.awayTeam,
+            matchDate: game.matchDate,
+            round: game.round,
+            status: game.status,
+            homeScore: game.homeScore,
+            awayScore: game.awayScore,
+          },
+        });
+        added++;
+        console.log(
+          `   ✅ Cadastrado: ${game.homeTeam} vs ${game.awayTeam} - ${dayjs(game.matchDate).format("DD/MM HH:mm")}`,
+        );
+      }
+    }
+
+    console.log(`📊 Rodada ${round}: ${added} novos, ${updated} atualizados`);
+    return { added, updated };
+  } catch (error) {
+    console.error(`❌ Erro ao sincronizar rodada ${round}:`, error);
+    return { added: 0, updated: 0 };
+  }
+}
+
+/**
+ * Detecta e sincroniza a próxima rodada automaticamente
+ */
+export async function syncNextRound(): Promise<{
+  round: number;
+  added: number;
+  updated: number;
+}> {
+  console.log("\n🔍 Detectando próxima rodada...");
+
+  try {
+    // Busca a última rodada cadastrada no banco
+    const lastMatch = await prisma.match.findFirst({
+      orderBy: { round: "desc" },
+      select: { round: true },
+    });
+
+    const lastRound = lastMatch?.round || 0;
+    const nextRound = lastRound + 1;
+
+    console.log(`📌 Última rodada: ${lastRound}, buscando rodada ${nextRound}`);
+
+    // Tenta buscar jogos da próxima rodada
+    const result = await syncRoundGames(nextRound);
+
+    if (result.added > 0 || result.updated > 0) {
+      console.log(`✅ Nova rodada ${nextRound} encontrada e sincronizada!`);
+
+      // Envia notificação no grupo se configurado
+      if (sock && BOLAO_GROUP_ID) {
+        const matches = await prisma.match.findMany({
+          where: { round: nextRound },
+          orderBy: { matchDate: "asc" },
+          take: 3,
+        });
+
+        if (matches.length > 0) {
+          const firstDate = dayjs(matches[0].matchDate).format(
+            "DD/MM [às] HH[h]mm",
+          );
+          let message = `🆕 *NOVA RODADA DISPONÍVEL!*\n\n`;
+          message += `⚽ *RODADA ${nextRound}*\n`;
+          message += `📅 Começa dia ${firstDate}\n\n`;
+          message += `🎯 ${result.added} jogos cadastrados\n\n`;
+          message += `_Digite !jogos para ver todos os jogos_`;
+
+          await sock.sendMessage(BOLAO_GROUP_ID, { text: message });
+        }
+      }
+
+      return { round: nextRound, added: result.added, updated: result.updated };
+    } else {
+      console.log(`📭 Rodada ${nextRound} ainda não disponível`);
+      return { round: 0, added: 0, updated: 0 };
+    }
+  } catch (error) {
+    console.error("❌ Erro ao detectar próxima rodada:", error);
+    return { round: 0, added: 0, updated: 0 };
+  }
+}
+
+/**
+ * Retorna o número da próxima rodada
+ */
+async function getNextRound(): Promise<number> {
+  const lastMatch = await prisma.match.findFirst({
+    orderBy: { round: "desc" },
+    select: { round: true },
+  });
+  return (lastMatch?.round || 0) + 1;
+}
+
+/**
+ * Verifica jogos adiados ou cancelados e notifica o grupo
+ * Quando um jogo é remarcado, desbloqueia as apostas
+ */
+export async function checkPostponedGames(): Promise<{
+  postponed: number;
+  rescheduled: number;
+}> {
+  console.log("\n🔍 Verificando jogos adiados/cancelados...");
+
+  try {
+    // Busca todos os jogos não finalizados dos últimos 7 dias
+    const sevenDaysAgo = dayjs().subtract(7, "days").toDate();
+    const matches = await prisma.match.findMany({
+      where: {
+        status: {
+          in: ["SCHEDULED", "LIVE", "POSTPONED", "CANCELLED"],
+        },
+        matchDate: {
+          gte: sevenDaysAgo,
+        },
+      },
+    });
+
+    if (!sock || !BOLAO_GROUP_ID) {
+      console.log("⚠️ WhatsApp não conectado, notificações não enviadas");
+      return { postponed: 0, rescheduled: 0 };
+    }
+
+    let postponedCount = 0;
+    let rescheduledCount = 0;
+
+    for (const match of matches) {
+      // Busca informações atualizadas do SofaScore
+      const games = await fetchBrasileiraoGames(new Date(match.matchDate));
+      const updatedGame = games.find(
+        (g) =>
+          g.homeTeam === match.homeTeam &&
+          g.awayTeam === match.awayTeam &&
+          g.round === match.round,
+      );
+
+      if (!updatedGame) continue;
+
+      // Caso 1: Jogo foi ADIADO (estava SCHEDULED ou LIVE, agora POSTPONED)
+      if (updatedGame.status === "POSTPONED" && match.status !== "POSTPONED") {
+        await prisma.match.update({
+          where: { id: match.id },
+          data: { status: "POSTPONED" },
+        });
+
+        postponedCount++;
+
+        const message =
+          `⚠️ *JOGO ADIADO*\n\n` +
+          `🏟️ *${match.homeTeam} x ${match.awayTeam}*\n` +
+          `📅 Rodada ${match.round}\n` +
+          `🕐 Horário original: ${dayjs(match.matchDate).format("DD/MM [às] HH[h]mm")}\n\n` +
+          `_O jogo foi adiado. As apostas continuam válidas e serão contabilizadas quando o jogo for remarcado._`;
+
+        await sock.sendMessage(BOLAO_GROUP_ID, { text: message });
+        console.log(`   ⚠️ Adiado: ${match.homeTeam} x ${match.awayTeam}`);
+      }
+
+      // Caso 2: Jogo foi CANCELADO (estava SCHEDULED, agora CANCELLED)
+      if (updatedGame.status === "CANCELLED" && match.status !== "CANCELLED") {
+        await prisma.match.update({
+          where: { id: match.id },
+          data: { status: "CANCELLED" },
+        });
+
+        // Remove todas as apostas deste jogo (jogo cancelado não conta)
+        await prisma.bet.deleteMany({
+          where: { matchId: match.id },
+        });
+
+        postponedCount++;
+
+        const message =
+          `❌ *JOGO CANCELADO*\n\n` +
+          `🏟️ *${match.homeTeam} x ${match.awayTeam}*\n` +
+          `📅 Rodada ${match.round}\n\n` +
+          `_O jogo foi cancelado pela CBF. As apostas foram removidas e não serão contabilizadas._`;
+
+        await sock.sendMessage(BOLAO_GROUP_ID, { text: message });
+        console.log(`   ❌ Cancelado: ${match.homeTeam} x ${match.awayTeam}`);
+      }
+
+      // Caso 3: Jogo foi REMARCADO (estava POSTPONED, agora SCHEDULED com nova data)
+      if (updatedGame.status === "SCHEDULED" && match.status === "POSTPONED") {
+        // Verifica se a data mudou (foi remarcado)
+        const oldDate = dayjs(match.matchDate);
+        const newDate = dayjs(updatedGame.matchDate);
+
+        if (!oldDate.isSame(newDate, "minute")) {
+          await prisma.match.update({
+            where: { id: match.id },
+            data: {
+              status: "SCHEDULED",
+              matchDate: updatedGame.matchDate,
+            },
+          });
+
+          // Desbloqueia apostas - permite novas apostas ou edições
+          // (apostas antigas continuam válidas)
+          rescheduledCount++;
+
+          const message =
+            `✅ *JOGO REMARCADO*\n\n` +
+            `🏟️ *${match.homeTeam} x ${match.awayTeam}*\n` +
+            `📅 Rodada ${match.round}\n\n` +
+            `🕐 *Novo horário:* ${newDate.format("DD/MM [às] HH[h]mm")}\n` +
+            `🕐 Horário antigo: ${oldDate.format("DD/MM [às] HH[h]mm")}\n\n` +
+            `_Apostas antigas continuam válidas. Você pode enviar novos palpites até o novo horário!_`;
+
+          await sock.sendMessage(BOLAO_GROUP_ID, { text: message });
+          console.log(
+            `   ✅ Remarcado: ${match.homeTeam} x ${match.awayTeam} → ${newDate.format("DD/MM HH:mm")}`,
+          );
+        }
+      }
+    }
+
+    console.log(
+      `📊 Verificação concluída: ${postponedCount} adiados/cancelados, ${rescheduledCount} remarcados`,
+    );
+    return { postponed: postponedCount, rescheduled: rescheduledCount };
+  } catch (error) {
+    console.error("❌ Erro ao verificar jogos adiados:", error);
+    return { postponed: 0, rescheduled: 0 };
   }
 }
 

@@ -59,7 +59,9 @@ export interface GameData {
   round: number;
   homeScore: number | null;
   awayScore: number | null;
-  status: "SCHEDULED" | "LIVE" | "FINISHED";
+  status: "SCHEDULED" | "LIVE" | "FINISHED" | "POSTPONED" | "CANCELLED";
+  isPostponed?: boolean;
+  postponedReason?: string;
 }
 
 // Browser singleton para reutilizar
@@ -102,6 +104,20 @@ export async function closeBrowser(): Promise<void> {
  */
 function normalizeTeamName(name: string): string {
   return TEAM_NAME_MAP[name] || name;
+}
+
+/**
+ * Converte o código de status do SofaScore para o status do sistema
+ * Códigos: 0=SCHEDULED, 6-50=LIVE, 70=POSTPONED, 80=CANCELLED, 100=FINISHED
+ */
+function convertStatus(
+  statusCode: number,
+): "SCHEDULED" | "LIVE" | "FINISHED" | "POSTPONED" | "CANCELLED" {
+  if (statusCode === 100) return "FINISHED"; // Finalizado
+  if (statusCode === 70) return "POSTPONED"; // Adiado
+  if (statusCode === 80 || statusCode === 90) return "CANCELLED"; // Cancelado
+  if (statusCode >= 6 && statusCode <= 50) return "LIVE"; // Ao vivo
+  return "SCHEDULED"; // Agendado
 }
 
 /**
@@ -301,11 +317,11 @@ export async function fetchLiveGames(): Promise<GameData[]> {
  * Busca jogos de uma rodada específica do Brasileirão
  */
 export async function fetchRoundGames(round: number): Promise<GameData[]> {
-  // URL da página do Brasileirão 2026 no SofaScore com a rodada específica
-  const url = `https://www.sofascore.com/pt/tournament/football/brazil/brasileirao-serie-a/${BRASILEIRAO_TOURNAMENT_ID}/season/${BRASILEIRAO_SEASON_ID}/matches/round/${round}`;
+  // Usamos a página principal do Brasileirão e selecionamos a rodada via DOM
+  const url = BRASILEIRAO_URL;
 
   console.log(`🔍 Buscando jogos da rodada ${round} via scraping...`);
-  console.log(`📎 URL: ${url}`);
+  console.log(`📎 URL base: ${url}`);
 
   let page: Page | null = null;
 
@@ -322,6 +338,105 @@ export async function fetchRoundGames(round: number): Promise<GameData[]> {
       waitUntil: "networkidle2",
       timeout: 30000,
     });
+
+    // Se foi solicitada uma rodada específica, tenta selecionar essa rodada no DOM
+    if (round && round > 0) {
+      try {
+        // espera carregamento leve
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+
+        // 1) Tenta selecionar por texto "Rodada X" ou apenas número
+        await page.evaluate(
+          new Function(
+            "targetRound",
+            "var clickIf=function(el){if(!el)return false;try{el.click();return true}catch(e){return false}};var roundText=String(targetRound);var candidates=Array.prototype.slice.call(document.querySelectorAll('button, a, div, span'));for(var i=0;i<candidates.length;i++){var c=candidates[i];var txt=(c.textContent||'').trim();if(!txt)continue;if(txt.indexOf('Rodada')!==-1&&txt.indexOf(roundText)!==-1){if(clickIf(c))return}if(/^\\d+$/.test(txt)&&txt===roundText){if(clickIf(c))return}}",
+          ) as unknown as any,
+          round,
+        );
+
+        // espera conteúdo reagir
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+
+        // 2) Se ainda não selecionou, tenta clicar repetidamente no botão "próximo" (seta SVG)
+        const alreadySelected = await page.evaluate((targetRound) => {
+          const sel = document.querySelector(
+            '[class*="roundSelector"] [class*="selected"]',
+          );
+          const txt = sel ? (sel.textContent || "").replace(/[^0-9]/g, "") : "";
+          return txt === String(targetRound);
+        }, round);
+
+        if (!alreadySelected) {
+          // Primeiro verifica qual rodada está selecionada
+          const currentRound = await page.evaluate(() => {
+            const sel = document.querySelector(
+              '[class*="roundSelector"] [class*="selected"]',
+            );
+            const txt = sel
+              ? (sel.textContent || "").replace(/[^0-9]/g, "")
+              : "";
+            return txt ? parseInt(txt, 10) : 1;
+          });
+
+          const targetRound = round;
+          const needsNext = targetRound > currentRound;
+          const needsPrev = targetRound < currentRound;
+          const maxClicks = Math.abs(targetRound - currentRound);
+
+          // Clica na seta apropriada (anterior ou próximo)
+          for (let i = 0; i < maxClicks && i < 10; i++) {
+            const clicked = await page.evaluate((goNext) => {
+              try {
+                // Procura por paths de svg que são setas
+                const paths = Array.from(document.querySelectorAll("svg path"));
+                const buttons: HTMLElement[] = [];
+
+                for (const p of paths) {
+                  const d = p.getAttribute("d") || "";
+                  // M18 12 é seta próximo (direita), M6 12 é seta anterior (esquerda)
+                  if (
+                    (goNext && d.indexOf("M18 12") !== -1) ||
+                    (!goNext && d.indexOf("M6 12") !== -1)
+                  ) {
+                    const btn = p.closest("button, a, div") as HTMLElement;
+                    if (btn && !buttons.includes(btn)) {
+                      buttons.push(btn);
+                    }
+                  }
+                }
+
+                if (buttons.length > 0) {
+                  buttons[0].click();
+                  return true;
+                }
+              } catch (e) {}
+              return false;
+            }, needsNext);
+
+            if (!clicked) break;
+            await new Promise((resolve) => setTimeout(resolve, 800));
+
+            const nowSelected = await page.evaluate((targetRound) => {
+              const sel = document.querySelector(
+                '[class*="roundSelector"] [class*="selected"]',
+              );
+              const txt = sel
+                ? (sel.textContent || "").replace(/[^0-9]/g, "")
+                : "";
+              return txt === String(targetRound);
+            }, targetRound);
+
+            if (nowSelected) break;
+          }
+        }
+      } catch (e) {
+        // não fatal — continuamos e tentamos capturar via DOM/API mesmo assim
+        console.log(
+          "⚠️ Não foi possível selecionar a rodada via DOM automaticamente:",
+          e,
+        );
+      }
+    }
 
     // Aguarda carregar
     await new Promise((resolve) => setTimeout(resolve, 3000));
@@ -417,158 +532,140 @@ export async function fetchRoundGames(round: number): Promise<GameData[]> {
           awayScore: number | null;
           statusCode: number;
         }> = [];
-        // Seleciona todos os elementos de partidas na lista da rodada
-        const matchRows = document.querySelectorAll(
-          '[class*="eventRow"], [class*="EventRow"]',
+
+        // Seleciona anchors de jogos
+        const anchors = Array.from(
+          document.querySelectorAll('a[class*="event-hl-"]'),
         );
-        matchRows.forEach((row) => {
+
+        anchors.forEach((a) => {
           try {
-            // Nome dos times
-            const homeTeam =
-              row.querySelector('[class*="HomeTeam"]')?.textContent?.trim() ||
-              "";
-            const awayTeam =
-              row.querySelector('[class*="AwayTeam"]')?.textContent?.trim() ||
-              "";
-            // Placar
-            const scoreEl = row.querySelector('[class*="score"]');
+            // Pega o ID do jogo do atributo data-id
+            const idStr = a.getAttribute("data-id");
+            const id = idStr ? parseInt(idStr, 10) : Math.random();
+
+            const fullText = a.textContent || "";
+
+            // Extrai data e hora (formatos: "dd/mm/aa HH:MM" ou "dd/mm/aaHH:MM" ou "dd/mm/aa")
+            const dateTimeMatch = fullText.match(
+              /(\d{2})\/(\d{2})\/(\d{2})\s*(\d{1,2}):(\d{2})/,
+            );
+            const dateOnlyMatch = fullText.match(/(\d{2})\/(\d{2})\/(\d{2})/);
+            let startTimestamp: number;
+
+            if (dateTimeMatch) {
+              // Formato com hora: DD/MM/AA HH:MM ou DD/MM/AAHH:MM
+              const day = parseInt(dateTimeMatch[1], 10);
+              const month = parseInt(dateTimeMatch[2], 10) - 1; // JS months are 0-indexed
+              const yearStr = dateTimeMatch[3];
+              const year = 2000 + parseInt(yearStr, 10);
+              const hour = parseInt(dateTimeMatch[4], 10);
+              const minute = parseInt(dateTimeMatch[5], 10);
+
+              const d = new Date(year, month, day, hour, minute);
+              startTimestamp = Math.floor(d.getTime() / 1000);
+            } else if (dateOnlyMatch) {
+              // Formato sem hora: DD/MM/AA
+              const day = parseInt(dateOnlyMatch[1], 10);
+              const month = parseInt(dateOnlyMatch[2], 10) - 1;
+              const yearStr = dateOnlyMatch[3];
+              const year = 2000 + parseInt(yearStr, 10);
+
+              const d = new Date(year, month, day, 0, 0);
+              startTimestamp = Math.floor(d.getTime() / 1000);
+            } else {
+              startTimestamp = Math.floor(Date.now() / 1000);
+            }
+
+            // Detecta status: "F" seguido de número indica finalizado (F2°T = Finalizado 2º Tempo)
+            const statusMatch = fullText.match(/F\d+°T/);
+            const isFinished = !!statusMatch;
+            const statusCode = isFinished ? 100 : 0;
+
+            // Extrai placar: dois dígitos consecutivos no final (só se finalizado)
             let homeScore: number | null = null;
             let awayScore: number | null = null;
-            if (scoreEl) {
-              const scoreText = scoreEl.textContent?.trim() || "";
-              const match = scoreText.match(/(\d+)\s*[xX-]\s*(\d+)/);
-              if (match) {
-                homeScore = parseInt(match[1], 10);
-                awayScore = parseInt(match[2], 10);
-              }
-            }
-            // Status
-            let statusCode = 0;
-            const statusText =
-              row
-                .querySelector('[class*="status"]')
-                ?.textContent?.toLowerCase() || "";
-            if (statusText.includes("final") || statusText.includes("encerrad"))
-              statusCode = 100;
-            else if (
-              statusText.includes("ao vivo") ||
-              statusText.includes("andamento")
-            )
-              statusCode = 6;
-            else statusCode = 0;
-            // Data/hora
-            let startTimestamp = Date.now() / 1000;
-            const dateEl = row.querySelector('[class*="date"]');
-            if (dateEl) {
-              // Exemplo: "28/01 21:00"
-              const dateText = dateEl.textContent?.trim() || "";
-              const match = dateText.match(
-                /(\d{2})\/(\d{2})\s*(\d{2}):(\d{2})/,
-              );
-              if (match) {
-                const [_, day, month, hour, minute] = match;
-                const year = new Date().getFullYear();
-                const date = new Date(
-                  Number(year),
-                  Number(month) - 1,
-                  Number(day),
-                  Number(hour),
-                  Number(minute),
-                );
-                startTimestamp = Math.floor(date.getTime() / 1000);
-              }
-            }
-            // Rodada (usa a informada na função)
-            let round = 2;
-            if (!games || games.length === 0) {
-              games = await page.evaluate(function(round) {
-                var results = [];
-                var matchLinks = document.querySelectorAll('a[class^="event-hl-"]');
-                for (var i = 0; i < matchLinks.length; i++) {
-                  var a = matchLinks[i];
-                  try {
-                    var dateBdi = a.querySelector('bdi.textStyle_body.small');
-                    var dateText = dateBdi && dateBdi.textContent ? dateBdi.textContent.trim() : "";
-                    var hourBdi = a.querySelector('span.score bdi.textStyle_body.small');
-                    var hourText = hourBdi && hourBdi.textContent ? hourBdi.textContent.trim() : "";
-                    var teamBdis = a.querySelectorAll('bdi.textStyle_body.medium.c_neutrals.nLv1.trunc_true');
-                    var homeTeam = teamBdis[0] && teamBdis[0].textContent ? teamBdis[0].textContent.trim() : "";
-                    var awayTeam = teamBdis[1] && teamBdis[1].textContent ? teamBdis[1].textContent.trim() : "";
-                    var scoreSpans = a.querySelectorAll('span.score');
-                    var homeScore = null;
-                    var awayScore = null;
-                    var statusCode = 0;
-                    if (scoreSpans.length > 1) {
-                      var scoreText = scoreSpans[1].textContent ? scoreSpans[1].textContent.trim() : "";
-                      var match = scoreText.match(/(\d+)\s*[xX-]\s*(\d+)/);
-                      if (match) {
-                        homeScore = parseInt(match[1], 10);
-                        awayScore = parseInt(match[2], 10);
-                        statusCode = 100;
-                      }
-                    }
-                    if (homeScore === null && awayScore === null) statusCode = 0;
-                    var startTimestamp = Date.now() / 1000;
-                    if (dateText && hourText) {
-                      var m = dateText.match(/(\d{2})\/(\d{2})\/(\d{2})/);
-                      var day, month, year;
-                      if (m) {
-                        day = m[1]; month = m[2]; year = m[3];
-                      } else {
-                        var m2 = dateText.match(/(\d{2})\/(\d{2})/);
-                        if (m2) {
-                          day = m2[1]; month = m2[2];
-                          year = String(new Date().getFullYear()).slice(-2);
-                        }
-                      }
-                      var fullYear = 2000 + parseInt(year, 10);
-                      var hmin = hourText.split(":");
-                      var h = parseInt(hmin[0], 10), min = parseInt(hmin[1], 10);
-                      var date = new Date(fullYear, parseInt(month, 10) - 1, parseInt(day, 10), h, min);
-                      startTimestamp = Math.floor(date.getTime() / 1000);
-                    }
-                    if (homeTeam && awayTeam) {
-                      results.push({
-                        id: Math.random(),
-                        homeTeam: homeTeam,
-                        awayTeam: awayTeam,
-                        startTimestamp: startTimestamp,
-                        round: round,
-                        homeScore: homeScore,
-                        awayScore: awayScore,
-                        statusCode: statusCode,
-                      });
-                    }
-                  } catch (e) {
-                    // ignora erro de linha
-                  }
-                }
-                return results;
-              }, round);
-              console.log(`📋 [DOM] Encontrados ${games.length} jogos da rodada`);
-            }
-    console.log("🧪 Testando scraping do SofaScore...");
-    const games = await fetchBrasileiraoFromMainPage();
 
-    if (games.length > 0) {
-      return {
-        success: true,
-        message: `Scraping funcionando! ${games.length} jogos encontrados.`,
-        games,
-      };
-    } else {
-      return {
-        success: true,
-        message: "Scraping funcionando, mas sem jogos encontrados na página.",
-        games: [],
-      };
+            if (isFinished) {
+              // Remove data e status para facilitar extração
+              let textClean = fullText
+                .replace(/\d{2}\/\d{2}\/\d{2}/, "")
+                .replace(/F\d+°T/, "");
+              // Pega os últimos 2 dígitos consecutivos
+              const scoreMatch = textClean.match(/(\d)(\d)$/);
+              if (scoreMatch) {
+                homeScore = parseInt(scoreMatch[1], 10);
+                awayScore = parseInt(scoreMatch[2], 10);
+              }
+            }
+
+            // Extrai nomes dos times do allText
+            const allTexts = Array.from(a.querySelectorAll("*"))
+              .map((el) => (el.textContent || "").trim())
+              .filter((t) => t && t.length >= 3 && t.length < 30);
+
+            // Pega textos únicos
+            const unique = allTexts.filter((t, i, arr) => arr.indexOf(t) === i);
+
+            // Procura os dois últimos nomes que parecem ser times
+            const teamCandidates = unique.filter(
+              (t) =>
+                !/^[\d:\/]+$/.test(t) && // Não é só números
+                !/^F\d+°T$/.test(t) && // Não é status
+                !/^\d{2}\/\d{2}\/\d{2}$/.test(t) && // Não é data
+                t.length >= 3,
+            );
+
+            let homeTeam = "";
+            let awayTeam = "";
+
+            if (teamCandidates.length >= 2) {
+              // Os dois últimos são os times (último é visitante, penúltimo é mandante)
+              awayTeam = teamCandidates[teamCandidates.length - 1];
+              homeTeam = teamCandidates[teamCandidates.length - 2];
+            }
+
+            if (homeTeam && awayTeam) {
+              results.push({
+                id,
+                homeTeam,
+                awayTeam,
+                startTimestamp,
+                round: 1,
+                homeScore,
+                awayScore,
+                statusCode,
+              });
+            }
+          } catch (e) {
+            /* ignore */
+          }
+        });
+
+        return results;
+      });
+      console.log(`📋 [DOM] Encontrados ${games.length} jogos do Brasileirão`);
     }
+
+    console.log(`📋 Encontrados ${games.length} jogos da rodada ${round}`);
+
+    return games.map((game) => ({
+      sofascoreId: game.id,
+      homeTeam: normalizeTeamName(game.homeTeam),
+      awayTeam: normalizeTeamName(game.awayTeam),
+      matchDate: new Date(game.startTimestamp * 1000),
+      round: game.round,
+      homeScore: game.homeScore,
+      awayScore: game.awayScore,
+      status: convertStatus(game.statusCode),
+    }));
   } catch (error) {
-    return {
-      success: false,
-      message: `Erro no scraping: ${error}`,
-      games: [],
-    };
+    console.error("❌ Erro ao buscar jogos da rodada:", error);
+    return [];
+  } finally {
+    if (page) {
+      await page.close();
+    }
   }
 }
 
@@ -702,79 +799,115 @@ export async function fetchBrasileiraoFromMainPage(): Promise<GameData[]> {
           awayScore: number | null;
           statusCode: number;
         }> = [];
-        // Seleciona todos os elementos de partidas na lista da rodada
-        const matchRows = document.querySelectorAll(
-          '[class*="eventRow"], [class*="EventRow"]',
+
+        // Seleciona anchors de jogos
+        const anchors = Array.from(
+          document.querySelectorAll('a[class*="event-hl-"]'),
         );
-        matchRows.forEach((row) => {
+
+        anchors.forEach((a) => {
           try {
-            // Nome dos times
-            const homeTeam =
-              row.querySelector('[class*="HomeTeam"]')?.textContent?.trim() ||
-              "";
-            const awayTeam =
-              row.querySelector('[class*="AwayTeam"]')?.textContent?.trim() ||
-              "";
-            // Placar
-            const scoreEl = row.querySelector('[class*="score"]');
+            // Pega o ID do jogo do atributo data-id
+            const idStr = a.getAttribute("data-id");
+            const id = idStr ? parseInt(idStr, 10) : Math.random();
+
+            const fullText = a.textContent || "";
+
+            // Extrai data e hora (formatos: "dd/mm/aa HH:MM" ou "dd/mm/aaHH:MM" ou "dd/mm/aa")
+            const dateTimeMatch = fullText.match(
+              /(\d{2})\/(\d{2})\/(\d{2})\s*(\d{1,2}):(\d{2})/,
+            );
+            const dateOnlyMatch = fullText.match(/(\d{2})\/(\d{2})\/(\d{2})/);
+            let startTimestamp: number;
+
+            if (dateTimeMatch) {
+              // Formato com hora: DD/MM/AA HH:MM ou DD/MM/AAHH:MM
+              const day = parseInt(dateTimeMatch[1], 10);
+              const month = parseInt(dateTimeMatch[2], 10) - 1; // JS months are 0-indexed
+              const yearStr = dateTimeMatch[3];
+              const year = 2000 + parseInt(yearStr, 10);
+              const hour = parseInt(dateTimeMatch[4], 10);
+              const minute = parseInt(dateTimeMatch[5], 10);
+
+              const d = new Date(year, month, day, hour, minute);
+              startTimestamp = Math.floor(d.getTime() / 1000);
+            } else if (dateOnlyMatch) {
+              // Formato sem hora: DD/MM/AA
+              const day = parseInt(dateOnlyMatch[1], 10);
+              const month = parseInt(dateOnlyMatch[2], 10) - 1;
+              const yearStr = dateOnlyMatch[3];
+              const year = 2000 + parseInt(yearStr, 10);
+
+              const d = new Date(year, month, day, 0, 0);
+              startTimestamp = Math.floor(d.getTime() / 1000);
+            } else {
+              startTimestamp = Math.floor(Date.now() / 1000);
+            }
+
+            // Detecta status: "F" seguido de número indica finalizado (F2°T = Finalizado 2º Tempo)
+            const statusMatch = fullText.match(/F\d+°T/);
+            const isFinished = !!statusMatch;
+            const statusCode = isFinished ? 100 : 0;
+
+            // Extrai placar: dois dígitos consecutivos no final (só se finalizado)
             let homeScore: number | null = null;
             let awayScore: number | null = null;
-            if (scoreEl) {
-              const scoreText = scoreEl.textContent?.trim() || "";
-              const match = scoreText.match(/(\d+)\s*[xX-]\s*(\d+)/);
-              if (match) {
-                homeScore = parseInt(match[1], 10);
-                awayScore = parseInt(match[2], 10);
+
+            if (isFinished) {
+              // Remove data e status para facilitar extração
+              let textClean = fullText
+                .replace(/\d{2}\/\d{2}\/\d{2}/, "")
+                .replace(/F\d+°T/, "");
+              // Pega os últimos 2 dígitos consecutivos
+              const scoreMatch = textClean.match(/(\d)(\d)$/);
+              if (scoreMatch) {
+                homeScore = parseInt(scoreMatch[1], 10);
+                awayScore = parseInt(scoreMatch[2], 10);
               }
             }
-            // Status
-            let statusCode = 0;
-            const statusText =
-              row
-                .querySelector('[class*="status"]')
-                ?.textContent?.toLowerCase() || "";
-            if (statusText.includes("final") || statusText.includes("encerrad"))
-              statusCode = 100;
-            else if (
-              statusText.includes("ao vivo") ||
-              statusText.includes("andamento")
-            )
-              statusCode = 6;
-            else statusCode = 0;
-            // Data/hora
-            let startTimestamp = Date.now() / 1000;
-            const dateEl = row.querySelector('[class*="date"]');
-            if (dateEl) {
-              // Exemplo: "28/01 21:00"
-              const dateText = dateEl.textContent?.trim() || "";
-              const match = dateText.match(
-                /(\d{2})\/(\d{2})\s*(\d{2}):(\d{2})/,
-              );
-              if (match) {
-                const [_, day, month, hour, minute] = match;
-                const year = new Date().getFullYear();
-                const date = new Date(
-                  Number(year),
-                  Number(month) - 1,
-                  Number(day),
-                  Number(hour),
-                  Number(minute),
-                );
-                startTimestamp = Math.floor(date.getTime() / 1000);
-              }
+
+            // Extrai nomes dos times do allText
+            const allTexts = Array.from(a.querySelectorAll("*"))
+              .map((el) => (el.textContent || "").trim())
+              .filter((t) => t && t.length >= 3 && t.length < 30);
+
+            // Pega textos únicos
+            const unique = allTexts.filter((t, i, arr) => arr.indexOf(t) === i);
+
+            // Procura os dois últimos nomes que parecem ser times
+            const teamCandidates = unique.filter(
+              (t) =>
+                !/^[\d:\/]+$/.test(t) && // Não é só números
+                !/^F\d+°T$/.test(t) && // Não é status
+                !/^\d{2}\/\d{2}\/\d{2}$/.test(t) && // Não é data
+                t.length >= 3,
+            );
+
+            let homeTeam = "";
+            let awayTeam = "";
+
+            if (teamCandidates.length >= 2) {
+              // Os dois últimos são os times (último é visitante, penúltimo é mandante)
+              awayTeam = teamCandidates[teamCandidates.length - 1];
+              homeTeam = teamCandidates[teamCandidates.length - 2];
             }
-            // Rodada (se disponível)
+
+            // Detecta rodada do seletor
             let round = 1;
             const roundEl = document.querySelector(
               '[class*="roundSelector"] [class*="selected"]',
             );
             if (roundEl) {
-              const roundText = roundEl.textContent?.replace(/[^\d]/g, "");
+              const roundText = (roundEl.textContent || "").replace(
+                /[^\d]/g,
+                "",
+              );
               if (roundText) round = parseInt(roundText, 10);
             }
+
             if (homeTeam && awayTeam) {
               results.push({
-                id: Math.random(),
+                id,
                 homeTeam,
                 awayTeam,
                 startTimestamp,
@@ -785,9 +918,10 @@ export async function fetchBrasileiraoFromMainPage(): Promise<GameData[]> {
               });
             }
           } catch (e) {
-            // ignora erro de linha
+            /* ignore */
           }
         });
+
         return results;
       });
       console.log(`📋 [DOM] Encontrados ${games.length} jogos do Brasileirão`);
@@ -812,5 +946,43 @@ export async function fetchBrasileiraoFromMainPage(): Promise<GameData[]> {
     if (page) {
       await page.close();
     }
+  }
+}
+
+/**
+ * Função de teste para validar o scraping
+ */
+export async function testScraping(): Promise<void> {
+  console.log("\n🧪 Iniciando teste do scraper...\n");
+
+  try {
+    // Testa busca da página principal
+    console.log("1️⃣ Testando fetchBrasileiraoFromMainPage()...");
+    const mainPageGames = await fetchBrasileiraoFromMainPage();
+    console.log(
+      `✅ Encontrados ${mainPageGames.length} jogos na página principal`,
+    );
+    if (mainPageGames.length > 0) {
+      console.log("Exemplo:", mainPageGames[0]);
+    }
+
+    // Testa busca de rodada específica
+    console.log("\n2️⃣ Testando fetchRoundGames(1)...");
+    const round1Games = await fetchRoundGames(1);
+    console.log(`✅ Encontrados ${round1Games.length} jogos na rodada 1`);
+    if (round1Games.length > 0) {
+      console.log("Exemplo:", round1Games[0]);
+    }
+
+    // Testa busca de jogos ao vivo
+    console.log("\n3️⃣ Testando fetchLiveGames()...");
+    const liveGames = await fetchLiveGames();
+    console.log(`✅ Encontrados ${liveGames.length} jogos ao vivo`);
+
+    console.log("\n✅ Teste concluído!");
+  } catch (error) {
+    console.error("\n❌ Erro no teste:", error);
+  } finally {
+    await closeBrowser();
   }
 }

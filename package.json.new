@@ -1,0 +1,51 @@
+{
+  "name": "chutai",
+  "version": "1.0.0",
+  "description": "Sistema de bolão de futebol via WhatsApp",
+  "scripts": {
+    "bot": "tsx src/bot.ts",
+    "admin": "tsx src/admin.ts",
+    "db:push": "prisma db push",
+    "db:studio": "prisma studio",
+    "clean": "tsx clean-database.ts",
+    "start": "tsx src/bot.ts",
+    "start:prod": "node dist/bot.js",
+    "build": "tsc"
+  },
+  "keywords": [
+    "bolao",
+    "futebol",
+    "brasileirao",
+    "palpites"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@fastify/cors": "^9.0.1",
+    "@fastify/formbody": "^8.0.2",
+    "@fastify/jwt": "^8.0.0",
+    "@fastify/static": "^9.0.0",
+    "@prisma/client": "^5.22.0",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "bcryptjs": "^2.4.3",
+    "dayjs": "^1.11.10",
+    "dotenv": "^16.4.5",
+    "fastify": "^4.26.0",
+    "node-cron": "^3.0.3",
+    "pino-pretty": "^10.3.1",
+    "puppeteer": "^24.36.1",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "qrcode-terminal": "^0.12.0",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^20.11.0",
+    "@types/node-cron": "^3.0.11",
+    "@types/qrcode-terminal": "^0.12.2",
+    "prisma": "^5.10.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}
