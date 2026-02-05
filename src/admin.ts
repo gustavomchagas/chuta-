@@ -15,6 +15,42 @@ dayjs.locale("pt-br");
 
 const app = Fastify({ logger: true });
 
+// Timer para enviar ranking parcial após salvar resultados
+let partialRankingTimer: NodeJS.Timeout | null = null;
+
+/**
+ * Adiciona sufixo do telefone ao nome quando há jogadores com mesmo nome
+ */
+async function addDisplayNames<
+  T extends { id: number; name: string; phone: string },
+>(players: T[]): Promise<(T & { displayName: string })[]> {
+  // Agrupa jogadores por nome (case insensitive)
+  const nameGroups = new Map<string, T[]>();
+
+  for (const player of players) {
+    const nameLower = player.name.toLowerCase();
+    if (!nameGroups.has(nameLower)) {
+      nameGroups.set(nameLower, []);
+    }
+    nameGroups.get(nameLower)!.push(player);
+  }
+
+  // Adiciona displayName com sufixo se necessário
+  return players.map((player) => {
+    const nameLower = player.name.toLowerCase();
+    const group = nameGroups.get(nameLower)!;
+
+    // Se só tem 1 jogador com esse nome, usa o nome normal
+    if (group.length === 1) {
+      return { ...player, displayName: player.name };
+    }
+
+    // Se há duplicatas, adiciona últimos 3 dígitos do telefone
+    const phoneSuffix = player.phone.slice(-3);
+    return { ...player, displayName: `${player.name} (${phoneSuffix})` };
+  });
+}
+
 // Plugin para servir arquivos estáticos manualmente
 app.register(cors, { origin: true });
 
@@ -187,6 +223,9 @@ app.put("/api/matches/:id/result", async (request) => {
     });
   }
 
+  // Agenda ranking parcial para 2 minutos depois
+  schedulePartialRanking(match.round);
+
   return { ...match, betsUpdated: bets.length };
 });
 
@@ -244,10 +283,20 @@ app.post("/api/games", async (request) => {
 // Atualizar resultado (compatibilidade)
 app.put("/api/games/:id/result", async (request) => {
   const { id } = request.params as { id: string };
-  const { homeScore, awayScore } = request.body as {
-    homeScore: number;
-    awayScore: number;
+  // Aceita tanto camelCase quanto snake_case do frontend
+  const body = request.body as {
+    homeScore?: number;
+    awayScore?: number;
+    home_score?: number;
+    away_score?: number;
   };
+
+  const homeScore = body.homeScore ?? body.home_score;
+  const awayScore = body.awayScore ?? body.away_score;
+
+  if (homeScore === undefined || awayScore === undefined) {
+    return { error: "homeScore e awayScore são obrigatórios" };
+  }
 
   const match = await prisma.match.update({
     where: { id },
@@ -274,6 +323,9 @@ app.put("/api/games/:id/result", async (request) => {
       data: { points },
     });
   }
+
+  // Agenda ranking parcial para 2 minutos depois
+  schedulePartialRanking(match.round);
 
   return { ...match, betsUpdated: bets.length };
 });
@@ -406,18 +458,133 @@ app.get("/api/ranking", async () => {
   }
 
   const ranking = (players as PlayerWithBets[])
-    .map((p) => ({
-      id: p.id,
-      name: p.name,
-      phone: p.phone,
-      totalPoints: p.bets.reduce((sum: number, b) => sum + (b.points || 0), 0),
-      totalBets: p.bets.length,
-      exactScores: 0,
-      correctWinners: 0,
-    }))
-    .sort((a, b) => b.totalPoints - a.totalPoints);
+    .map((p) => {
+      const betsWithPoints = p.bets.filter((b) => b.points !== null);
+      return {
+        id: Number(p.id),
+        name: p.name,
+        phone: p.phone,
+        totalPoints: betsWithPoints.reduce(
+          (sum: number, b) => sum + (b.points || 0),
+          0,
+        ),
+        totalBets: betsWithPoints.length,
+        exactScores: betsWithPoints.filter((b) => b.points === 2).length,
+        correctWinners: betsWithPoints.filter((b) => b.points === 1).length,
+      };
+    })
+    .sort((a, b) => {
+      // Ordena por pontos, depois por exatos, depois por acertos
+      if (b.totalPoints !== a.totalPoints) return b.totalPoints - a.totalPoints;
+      if (b.exactScores !== a.exactScores) return b.exactScores - a.exactScores;
+      return b.correctWinners - a.correctWinners;
+    });
 
-  return ranking;
+  // Adiciona displayName com diferenciação para duplicatas
+  const rankingWithDisplayNames = await addDisplayNames(ranking);
+
+  return rankingWithDisplayNames;
+});
+
+// Ranking por rodada específica
+app.get("/api/ranking/:round", async (request) => {
+  const { round } = request.params as { round: string };
+  const roundNumber = parseInt(round);
+
+  // Busca jogos da rodada com palpites
+  const matches = await prisma.match.findMany({
+    where: { round: roundNumber },
+    include: {
+      bets: {
+        include: { player: true },
+      },
+    },
+  });
+
+  if (matches.length === 0) {
+    return { error: "Rodada não encontrada", ranking: [] };
+  }
+
+  // Calcula pontuação por jogador na rodada
+  const playerStats = new Map<
+    string,
+    {
+      id: number;
+      name: string;
+      phone: string;
+      totalPoints: number;
+      exactScores: number;
+      correctWinners: number;
+      totalBets: number;
+    }
+  >();
+
+  for (const match of matches) {
+    for (const bet of match.bets) {
+      const existing = playerStats.get(bet.playerId) || {
+        id: bet.player.id,
+        name: bet.player.name,
+        phone: bet.player.phone,
+        totalPoints: 0,
+        exactScores: 0,
+        correctWinners: 0,
+        totalBets: 0,
+      };
+
+      if (bet.points !== null) {
+        existing.totalPoints += bet.points;
+        existing.totalBets++;
+        if (bet.points === 2) existing.exactScores++;
+        if (bet.points === 1) existing.correctWinners++;
+      }
+
+      playerStats.set(bet.playerId, existing);
+    }
+  }
+
+  const ranking = Array.from(playerStats.values()).sort((a, b) => {
+    if (b.totalPoints !== a.totalPoints) return b.totalPoints - a.totalPoints;
+    if (b.exactScores !== a.exactScores) return b.exactScores - a.exactScores;
+    return b.correctWinners - a.correctWinners;
+  });
+
+  const rankingWithDisplayNames = await addDisplayNames(ranking);
+
+  const finishedMatches = matches.filter((m) => m.status === "FINISHED").length;
+
+  return {
+    round: roundNumber,
+    totalMatches: matches.length,
+    finishedMatches,
+    ranking: rankingWithDisplayNames,
+  };
+});
+
+// Lista rodadas disponíveis
+app.get("/api/rounds", async () => {
+  const rounds = await prisma.match.groupBy({
+    by: ["round"],
+    _count: { id: true },
+    orderBy: { round: "asc" },
+  });
+
+  const roundsWithStatus = await Promise.all(
+    rounds.map(async (r) => {
+      const matches = await prisma.match.findMany({
+        where: { round: r.round },
+        select: { status: true },
+      });
+      const finished = matches.filter((m) => m.status === "FINISHED").length;
+      return {
+        round: r.round,
+        totalMatches: r._count.id,
+        finishedMatches: finished,
+        isComplete: finished === r._count.id,
+      };
+    }),
+  );
+
+  return roundsWithStatus;
 });
 
 // Lista palpites de um jogo
@@ -461,6 +628,57 @@ function calculatePoints(
   }
 
   return 0;
+}
+
+// ============================================
+// RANKING PARCIAL AUTOMÁTICO
+// ============================================
+
+/**
+ * Agenda envio de ranking parcial para 2 minutos depois
+ * Cancela timer anterior se existir (para aguardar todos os resultados)
+ */
+function schedulePartialRanking(round: number) {
+  // Cancela timer anterior se existir
+  if (partialRankingTimer) {
+    clearTimeout(partialRankingTimer);
+  }
+
+  // Agenda novo envio para 2 minutos
+  partialRankingTimer = setTimeout(
+    async () => {
+      try {
+        await sendPartialRanking(round);
+        console.log(`📊 Ranking parcial da rodada ${round} enviado`);
+      } catch (error) {
+        console.error("Erro ao enviar ranking parcial:", error);
+      }
+    },
+    2 * 60 * 1000,
+  ); // 2 minutos
+
+  console.log(`⏱️  Ranking parcial da rodada ${round} agendado para 2 minutos`);
+}
+
+/**
+ * Envia ranking parcial para o grupo do WhatsApp via API do bot
+ */
+async function sendPartialRanking(round: number) {
+  const BOT_API_URL = process.env.BOT_API_URL || "http://localhost:3335";
+
+  try {
+    const response = await fetch(
+      `${BOT_API_URL}/send-partial-ranking?round=${round}`,
+      { method: "POST" },
+    );
+
+    if (!response.ok) {
+      const error = await response.json();
+      console.error("Erro ao enviar ranking via API:", error);
+    }
+  } catch (error) {
+    console.error("Erro ao conectar com API do bot:", error);
+  }
 }
 
 // ============================================

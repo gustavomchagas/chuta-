@@ -8,19 +8,28 @@ import makeWASocket, {
 import { Boom } from "@hapi/boom";
 import qrcode from "qrcode-terminal";
 import path from "path";
+import http from "http";
 import { prisma } from "../lib/prisma";
 import { parseBets } from "../utils/betParser";
 import dayjs from "dayjs";
 import "dayjs/locale/pt-br";
-// Usa o scraper com Puppeteer em vez da API (que bloqueia requisições)
+import utc from "dayjs/plugin/utc";
+import timezone from "dayjs/plugin/timezone";
+// Usa a API direta do SofaScore (mais confiável que scraping)
 import {
-  fetchBrasileiraoGames,
+  fetchScheduledGames,
   fetchLiveGames,
   fetchRoundGames,
   type GameData,
-} from "../services/sofascoreScraper";
+} from "../services/sofascore";
 
+// Alias para compatibilidade
+const fetchBrasileiraoGames = fetchScheduledGames;
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
 dayjs.locale("pt-br");
+dayjs.tz.setDefault("America/Sao_Paulo");
 
 const AUTH_FOLDER = path.join(__dirname, "../../auth_info_baileys");
 
@@ -28,6 +37,87 @@ let sock: WASocket | null = null;
 
 // ID do grupo do bolão (será configurado)
 let BOLAO_GROUP_ID: string | null = null;
+
+/**
+ * Obtém o nome de exibição do jogador, adicionando sufixo do telefone
+ * quando há outro jogador com o mesmo nome
+ */
+async function getPlayerDisplayName(
+  playerId: number,
+  playerName: string,
+): Promise<string> {
+  try {
+    // Busca se há outros jogadores com o mesmo nome
+    const playersWithSameName = await prisma.player.findMany({
+      where: {
+        name: {
+          equals: playerName,
+          mode: "insensitive",
+        },
+      },
+      select: {
+        id: true,
+        phone: true,
+      },
+    });
+
+    // Se só tem um jogador com esse nome, retorna o nome normal
+    if (playersWithSameName.length <= 1) {
+      return playerName;
+    }
+
+    // Se há duplicados, adiciona os últimos 3 dígitos do telefone
+    const currentPlayer = playersWithSameName.find((p) => p.id === playerId);
+    if (!currentPlayer) {
+      return playerName;
+    }
+
+    const phoneSuffix = currentPlayer.phone.slice(-3);
+    return `${playerName} (${phoneSuffix})`;
+  } catch (error) {
+    console.error("❌ Erro ao buscar nome de exibição:", error);
+    return playerName;
+  }
+}
+
+/**
+ * Busca a quantidade de membros do grupo que ainda não palpitaram
+ * Retorna apenas a contagem (total membros - quem já palpitou)
+ */
+async function getPendingMembersCount(matchesToday: any[]): Promise<number> {
+  if (!sock || !BOLAO_GROUP_ID) return 0;
+
+  try {
+    // Busca metadados do grupo
+    const groupMetadata = await sock.groupMetadata(BOLAO_GROUP_ID);
+    const members = groupMetadata.participants;
+
+    // Remove o bot da contagem
+    const botNumber = "553597756801";
+    const totalMembers = members.filter(
+      (m) => !m.id.includes(botNumber),
+    ).length;
+
+    // Busca jogadores que já palpitaram nos jogos de hoje
+    const playerIdsWhoBet = new Set(
+      matchesToday.flatMap((m) => m.bets.map((b: any) => b.playerId)),
+    );
+
+    // Conta quantos jogadores distintos já palpitaram
+    const playersWhoBetCount = playerIdsWhoBet.size;
+
+    const pendingCount = totalMembers - playersWhoBetCount;
+
+    console.log(
+      `👥 Grupo tem ${totalMembers} membros (exceto bot), ${playersWhoBetCount} já palpitaram, ${pendingCount} pendentes`,
+    );
+
+    return Math.max(0, pendingCount); // Garante que não seja negativo
+  } catch (error) {
+    console.error("❌ Erro ao buscar membros do grupo:", error);
+    return 0;
+  }
+}
 
 /**
  * Extrai o nome do jogador da mensagem, se houver.
@@ -124,6 +214,9 @@ export async function initBot() {
 
       // Inicia scheduler de sincronização SofaScore
       startSofaScoreSchedulers();
+
+      // Inicia servidor HTTP interno para comunicação com admin
+      startInternalHttpServer();
     }
   });
 
@@ -314,79 +407,14 @@ async function handleCommand(
       break;
 
     case "!sync":
-    case "!sincronizar":
-      // Força sincronização com SofaScore
-      if (sock) {
-        await sock.sendMessage(chatId, {
-          text: "🔄 Sincronizando jogos do Brasileirão...",
-        });
-        const result = await syncTodayGames();
-        await sock.sendMessage(chatId, {
-          text: `✅ Sincronização completa!\n\n📊 ${result.added} jogos novos\n✏️ ${result.updated} atualizados`,
-        });
-      }
-      break;
-
-    case "!syncrodada":
-    case "!sincronizarrodada":
-      // Sincroniza rodada específica
-      if (sock) {
-        const roundNum = arg ? parseInt(arg) : await getNextRound();
-        if (!isNaN(roundNum) && roundNum > 0) {
-          await sock.sendMessage(chatId, {
-            text: `🔄 Sincronizando rodada ${roundNum}...`,
-          });
-          const result = await syncRoundGames(roundNum);
-          await sock.sendMessage(chatId, {
-            text: `✅ Rodada ${roundNum} sincronizada!\n\n📊 ${result.added} jogos novos\n✏️ ${result.updated} atualizados`,
-          });
-        } else {
-          await sock.sendMessage(chatId, {
-            text: "❌ Número de rodada inválido. Use: !syncrodada 2",
-          });
-        }
-      }
-      break;
-
-    case "!proxima":
-    case "!proximarodada":
-      // Sincroniza próxima rodada automaticamente
-      if (sock) {
-        await sock.sendMessage(chatId, {
-          text: "🔄 Buscando próxima rodada...",
-        });
-        const result = await syncNextRound();
-        if (result.round > 0) {
-          await sock.sendMessage(chatId, {
-            text: `✅ Rodada ${result.round} detectada e sincronizada!\n\n📊 ${result.added} jogos cadastrados\n✏️ ${result.updated} atualizados\n\n🎯 Use !jogos para ver os jogos`,
-          });
-        } else {
-          await sock.sendMessage(chatId, {
-            text: "📭 Nenhuma rodada nova encontrada no momento.",
-          });
-        }
-      }
-      break;
-
-    case "!verificar":
-    case "!verificaradiados":
-      // Verifica jogos adiados/cancelados
-      if (sock) {
-        await sock.sendMessage(chatId, {
-          text: "🔍 Verificando jogos adiados e remarcados...",
-        });
-        const result = await checkPostponedGames();
-        if (result.postponed === 0 && result.rescheduled === 0) {
-          await sock.sendMessage(chatId, {
-            text: "✅ Nenhuma alteração detectada. Todos os jogos mantêm seus horários!",
-          });
-        } else {
-          await sock.sendMessage(chatId, {
-            text: `📊 Verificação concluída!\n\n⚠️ ${result.postponed} jogo(s) adiado(s)/cancelado(s)\n✅ ${result.rescheduled} jogo(s) remarcado(s)`,
-          });
-        }
-      }
-      break;
+    // COMANDOS DE SINCRONIZAÇÃO DESATIVADOS - CADASTRO MANUAL VIA PAINEL ADMIN
+    // case "!sincronizar":
+    // case "!syncrodada":
+    // case "!sincronizarrodada":
+    // case "!proxima":
+    // case "!proximarodada":
+    // case "!verificar":
+    // case "!verificaradiados":
 
     case "!ajuda":
     case "!help":
@@ -535,8 +563,11 @@ async function handlePossibleBet(
   if (savedBets.length > 0 || alreadyBet.length > 0 || errors.length > 0) {
     let response = "";
 
+    // Obtém nome de exibição com diferenciação se necessário
+    const displayName = await getPlayerDisplayName(player.id, player.name);
+
     if (savedBets.length > 0) {
-      response += `✅ *Palpites de ${player.name} registrados!*\n\n`;
+      response += `✅ *Palpites de ${displayName} registrados!*\n\n`;
       response += savedBets.join("\n");
       response += `\n\n⚠️ *ATENÇÃO: Palpites não podem ser alterados!*`;
     }
@@ -585,11 +616,25 @@ async function sendRoundMatches(chatId: string) {
   }
 
   const round = matches[0].round;
+
+  // Filtra jogos: apenas próximos 3 dias (evita jogos adiados muito distantes)
+  const threeDaysFromNow = dayjs().add(3, "day").endOf("day");
+  const filteredMatches = matches.filter((match) =>
+    dayjs(match.matchDate).isBefore(threeDaysFromNow),
+  );
+
+  if (filteredMatches.length === 0) {
+    await sock.sendMessage(chatId, {
+      text: `⏰ Os jogos da rodada ${round} ainda não estão disponíveis para palpites.\n\nAguarde até faltarem 3 dias para o início dos jogos!`,
+    });
+    return;
+  }
+
   let message = `⚽ *RODADA ${round} - BRASILEIRÃO 2026*\n\n`;
 
-  // Agrupa por data
-  const byDate = new Map<string, typeof matches>();
-  for (const match of matches) {
+  // Agrupa por data (servidor já está em America/Sao_Paulo)
+  const byDate = new Map<string, typeof filteredMatches>();
+  for (const match of filteredMatches) {
     const dateKey = dayjs(match.matchDate).format("YYYY-MM-DD");
     if (!byDate.has(dateKey)) {
       byDate.set(dateKey, []);
@@ -606,7 +651,14 @@ async function sendRoundMatches(chatId: string) {
 
     for (const match of dateMatches) {
       const time = dayjs(match.matchDate).format("HH[h]mm");
-      message += `${matchNumber}️⃣ ${match.homeTeam} x ${match.awayTeam} (${time})\n`;
+
+      // Formata número com emojis individuais para cada dígito
+      const numberEmojis = matchNumber
+        .toString()
+        .split("")
+        .map((d) => `${d}️⃣`)
+        .join("");
+      message += `${numberEmojis} ${match.homeTeam} x ${match.awayTeam} (${time})\n`;
       matchNumber++;
     }
     message += "\n";
@@ -614,23 +666,22 @@ async function sendRoundMatches(chatId: string) {
 
   message += `---\n`;
   message += `📝 *Como palpitar:*\n`;
-  message += `Envie todos os palpites de uma vez só!\n\n`;
+  message += `Envie todos os palpites de uma vez só!`;
 
-  // Gera exemplo com os times reais da rodada
-  message += `*Exemplo:*\n`;
-  let exampleNumber = 1;
+  // Envia primeira mensagem com as informações completas
+  await sock.sendMessage(chatId, { text: message });
+
+  // Monta segunda mensagem apenas com os jogos para copiar
+  let copyMessage = ``;
   for (const [, dateMatches] of byDate) {
     for (const match of dateMatches) {
-      const homeScore = Math.floor(Math.random() * 3);
-      const awayScore = Math.floor(Math.random() * 3);
-      message += `${match.homeTeam} ${homeScore} x ${awayScore} ${match.awayTeam}\n`;
-      exampleNumber++;
+      copyMessage += `${match.homeTeam} x ${match.awayTeam}\n`;
     }
   }
+  copyMessage += `\n💡 _Copie, altere os placares e envie!_`;
 
-  message += `\n💡 _Copie, altere os placares e envie!_`;
-
-  await sock.sendMessage(chatId, { text: message });
+  // Envia segunda mensagem com lista para copiar
+  await sock.sendMessage(chatId, { text: copyMessage });
 }
 
 /**
@@ -723,10 +774,12 @@ async function sendRoundRanking(chatId: string, roundNumber: number) {
 
   // Agrupa pontos por jogador
   interface PlayerRoundStats {
+    id: number;
     name: string;
     points: number;
     bets: number;
     exactScores: number;
+    correctWinners: number;
   }
 
   const playerStats = new Map<string, PlayerRoundStats>();
@@ -734,16 +787,19 @@ async function sendRoundRanking(chatId: string, roundNumber: number) {
   for (const match of matches) {
     for (const bet of match.bets) {
       const existing = playerStats.get(bet.playerId) || {
+        id: bet.player.id,
         name: bet.player.name,
         points: 0,
         bets: 0,
         exactScores: 0,
+        correctWinners: 0,
       };
 
       existing.bets++;
       if (bet.points !== null) {
         existing.points += bet.points;
         if (bet.points === 2) existing.exactScores++;
+        if (bet.points === 1) existing.correctWinners++;
       }
 
       playerStats.set(bet.playerId, existing);
@@ -752,7 +808,8 @@ async function sendRoundRanking(chatId: string, roundNumber: number) {
 
   const ranking = Array.from(playerStats.values()).sort((a, b) => {
     if (b.points !== a.points) return b.points - a.points;
-    return b.exactScores - a.exactScores;
+    if (b.exactScores !== a.exactScores) return b.exactScores - a.exactScores;
+    return b.correctWinners - a.correctWinners;
   });
 
   if (ranking.length === 0) {
@@ -768,12 +825,23 @@ async function sendRoundRanking(chatId: string, roundNumber: number) {
 
   let message = `🏆 *RANKING RODADA ${roundNumber}* (${statusText})\n\n`;
 
+  // Mostra resultados se houver jogos finalizados
+  if (finishedMatches.length > 0) {
+    message += `*Resultados:*\n`;
+    for (const match of finishedMatches) {
+      message += `✅ ${match.homeTeam} ${match.homeScore} x ${match.awayScore} ${match.awayTeam}\n`;
+    }
+    message += `\n`;
+  }
+
+  message += `*Classificação:*\n`;
   const medals = ["🥇", "🥈", "🥉"];
-  ranking.forEach((player, index) => {
+  for (let index = 0; index < ranking.length; index++) {
+    const player = ranking[index];
     const medal = medals[index] || `${index + 1}.`;
-    message += `${medal} *${player.name}*\n`;
-    message += `   ${player.points} pts | ${player.exactScores} cravadas\n\n`;
-  });
+    const displayName = await getPlayerDisplayName(player.id, player.name);
+    message += `${medal} ${displayName}: ${player.points} pts (${player.exactScores} exatos, ${player.correctWinners} acertos)\n`;
+  }
 
   await sock.sendMessage(chatId, { text: message });
 }
@@ -827,6 +895,7 @@ async function sendCurrentRoundStatus(chatId: string) {
 
   // Calcula pontuação parcial
   interface PlayerRoundStats {
+    id: number;
     name: string;
     points: number;
     exactScores: number;
@@ -838,6 +907,7 @@ async function sendCurrentRoundStatus(chatId: string) {
   for (const match of matches) {
     for (const bet of match.bets) {
       const existing = playerStats.get(bet.playerId) || {
+        id: bet.player.id,
         name: bet.player.name,
         points: 0,
         exactScores: 0,
@@ -882,19 +952,33 @@ async function sendCurrentRoundStatus(chatId: string) {
     message += `\n`;
   }
 
-  // Mostra ranking parcial
+  // Mostra ranking parcial (todos os participantes)
   if (ranking.length > 0 && finishedMatches.length > 0) {
     message += `*Ranking parcial:*\n`;
     const medals = ["🥇", "🥈", "🥉"];
-    ranking.slice(0, 10).forEach((player, index) => {
+    for (let index = 0; index < ranking.length; index++) {
+      const player = ranking[index];
       const medal = medals[index] || `${index + 1}.`;
       const pendingText =
         player.pendingBets > 0 ? ` (+${player.pendingBets} jogos)` : "";
-      message += `${medal} ${player.name}: ${player.points} pts${pendingText}\n`;
-    });
+      const displayName = await getPlayerDisplayName(player.id, player.name);
+      message += `${medal} ${displayName}: ${player.points} pts${pendingText}\n`;
+    }
   }
 
   await sock.sendMessage(chatId, { text: message });
+}
+
+/**
+ * Envia ranking parcial para o grupo (chamado pelo painel admin)
+ */
+export async function sendPartialRankingNotification(round: number) {
+  if (!sock || !BOLAO_GROUP_ID) {
+    console.log("⚠️  WhatsApp não conectado ou grupo não configurado");
+    return;
+  }
+
+  await sendCurrentRoundStatus(BOLAO_GROUP_ID);
 }
 
 /**
@@ -945,23 +1029,49 @@ async function sendPendingBets(chatId: string) {
   }
 
   let message = `⏳ *AINDA FALTAM PALPITAR:*\n\n`;
-  message += pendingPlayers.map((p: PlayerType) => `• ${p.name}`).join("\n");
-  message += `\n\n📝 Enviem seus palpites, galera!`;
+  for (const p of pendingPlayers) {
+    const displayName = await getPlayerDisplayName(p.id, p.name);
+    message += `• ${displayName}\n`;
+  }
+  message += `\n📝 Enviem seus palpites, galera!`;
 
   await sock.sendMessage(chatId, { text: message });
 }
 
 /**
- * Envia todos os palpites da rodada atual
+ * Envia todos os palpites da rodada atual (incluindo jogos finalizados)
  */
 async function sendAllBets(chatId: string) {
   if (!sock) return;
 
   const today = dayjs().startOf("day").toDate();
+
+  // Busca a rodada atual (jogos de hoje em diante ou jogos recentes finalizados)
+  const recentMatch = await prisma.match.findFirst({
+    where: {
+      OR: [
+        { matchDate: { gte: today } },
+        {
+          status: "FINISHED",
+          matchDate: { gte: dayjs().subtract(2, "day").toDate() },
+        },
+      ],
+    },
+    orderBy: { matchDate: "asc" },
+    select: { round: true },
+  });
+
+  if (!recentMatch) {
+    await sock.sendMessage(chatId, {
+      text: "📭 Não há jogos da rodada no momento.",
+    });
+    return;
+  }
+
+  // Busca TODOS os jogos da rodada (incluindo finalizados)
   const matches = await prisma.match.findMany({
     where: {
-      status: "SCHEDULED",
-      matchDate: { gte: today },
+      round: recentMatch.round,
     },
     include: {
       bets: {
@@ -980,16 +1090,28 @@ async function sendAllBets(chatId: string) {
     return;
   }
 
-  let message = "📋 *PALPITES DA RODADA*\n\n";
+  let message = `📋 *PALPITES DA RODADA ${recentMatch.round}*\n\n`;
 
   for (const match of matches) {
-    message += `*${match.homeTeam} x ${match.awayTeam}*\n`;
+    // Indica se jogo já terminou
+    const statusIcon = match.status === "FINISHED" ? "✅" : "⚽";
+    const resultText =
+      match.status === "FINISHED" && match.homeScore !== null
+        ? ` (${match.homeScore}x${match.awayScore})`
+        : "";
+
+    message += `${statusIcon} *${match.homeTeam} x ${match.awayTeam}*${resultText}\n`;
 
     if (match.bets.length === 0) {
-      message += `  _Nenhum palpite ainda_\n`;
+      message += `  _Nenhum palpite_\n`;
     } else {
       for (const bet of match.bets) {
-        message += `  • ${bet.player.name}: ${bet.homeScoreGuess}x${bet.awayScoreGuess}\n`;
+        const displayName = await getPlayerDisplayName(
+          bet.player.id,
+          bet.player.name,
+        );
+        const pointsText = bet.points !== null ? ` → ${bet.points}pts` : "";
+        message += `  • ${displayName}: ${bet.homeScoreGuess}x${bet.awayScoreGuess}${pointsText}\n`;
       }
     }
     message += "\n";
@@ -1031,7 +1153,8 @@ async function sendUserBets(chatId: string, senderId: string) {
     return;
   }
 
-  let message = `📝 *Seus últimos palpites, ${player.name}:*\n\n`;
+  const displayName = await getPlayerDisplayName(player.id, player.name);
+  let message = `📝 *Seus últimos palpites, ${displayName}:*\n\n`;
 
   for (const bet of player.bets) {
     const pointsStr = bet.points !== null ? ` → ${bet.points}pts` : "";
@@ -1070,26 +1193,28 @@ async function sendBotInfo(chatId: string) {
     `━━━━━━━━━━━━━━━━━━━━\n\n` +
     `🤖 *FUNCIONAMENTO DO BOT*\n\n` +
     `📍 *Notificações Automáticas:*\n` +
-    `• 08h - Bom dia com jogos do dia\n` +
-    `• 08h/11h/14h/17h/20h - Lembretes periódicos\n` +
+    `• 09h - Bom dia com jogos do dia\n` +
+    `• 09h/11h/14h/17h/20h - Lembretes periódicos\n` +
     `• 1h antes - Última chamada!\n\n` +
-    `⚽ *Atualizações em Tempo Real:*\n` +
-    `• Gols são notificados automaticamente\n` +
-    `• Resultados atualizados a cada 2 minutos\n` +
-    `• Pontuação calculada ao final de cada jogo\n\n` +
-    `📊 *Sincronização com SofaScore:*\n` +
-    `• 06h - Sincroniza jogos do dia\n` +
-    `• 10h - Verifica jogos adiados/remarcados\n` +
-    `• Segunda 02h - Detecta nova rodada\n\n` +
+    `📝 *Cadastro e Atualização:*\n` +
+    `• Jogos e resultados cadastrados manualmente\n` +
+    `• pelo administrador via painel de controle\n\n` +
     `━━━━━━━━━━━━━━━━━━━━\n\n` +
     `📝 *COMO PALPITAR*\n\n` +
     `Envie seus palpites no formato:\n` +
     `\`Time Casa X x Y Time Fora\`\n\n` +
-    `*Exemplo:*\n` +
-    `Flamengo 2x1 Vasco\n` +
-    `Palmeiras 3x0 Corinthians\n` +
-    `São Paulo 1x1 Santos\n\n` +
-    `💡 *Dica:* Envie todos os palpites de uma vez!\n\n` +
+    `*Exemplo de mensagem completa:*\n\n` +
+    `Sport 1 x 2 Atlético-MG\n` +
+    `Vasco 2 x 0 Juventude\n` +
+    `Inter 1 x 1 Bahia\n` +
+    `São Paulo 2 x 0 Bragantino\n` +
+    `Corinthians 1 x 0 Ceará\n` +
+    `Cruzeiro 2 x 0 Fluminense\n` +
+    `Vitória 1 x 0 Botafogo\n` +
+    `Flamengo 3 x 0 Santos\n` +
+    `Fortaleza 1 x 0 Grêmio\n` +
+    `Mirassol 1 x 1 Palmeiras\n\n` +
+    `💡 *Dica:* Copie a lista de jogos e altere os placares!\n\n` +
     `━━━━━━━━━━━━━━━━━━━━\n\n` +
     `⚙️ *COMANDOS DISPONÍVEIS*\n\n` +
     `Use *!ajuda* para ver lista completa de comandos\n\n` +
@@ -1116,17 +1241,15 @@ async function sendHelp(chatId: string) {
     `*!ranking* - Ranking geral do bolão\n` +
     `*!ranking X* - Ranking da rodada X\n` +
     `*!rodada* - Status e parcial da rodada atual\n\n` +
-    `*🔄 Sincronização:*\n` +
-    `*!sync* - Sincroniza jogos de hoje\n` +
-    `*!syncrodada X* - Sincroniza rodada X\n` +
-    `*!proxima* - Busca e cadastra próxima rodada\n` +
-    `*!verificar* - Verifica jogos adiados/remarcados\n\n` +
-    `*📝 Para palpitar:*\n` +
+    `*� Para palpitar:*\n` +
     `Envie todos os palpites de uma vez!\n` +
     `Ex: \`Flamengo 2x1 Vasco\`\n\n` +
     `*👥 Palpitar em nome de outra pessoa:*\n` +
     `NOME DA PESSOA\n` +
-    `Flamengo 2x1 Vasco`;
+    `Flamengo 2x1 Vasco\n\n` +
+    `*ℹ️ Cadastro de Jogos:*\n` +
+    `Os jogos são cadastrados manualmente\n` +
+    `pelo administrador via painel de controle.`;
 
   await sock.sendMessage(chatId, { text: message });
 }
@@ -1140,15 +1263,15 @@ let reminderSchedulerRunning = false;
 
 /**
  * Inicia o scheduler de notificações matinais
- * Envia os jogos do dia automaticamente às 8h da manhã
+ * Envia os jogos do dia automaticamente às 9h da manhã
  */
 function startMorningNotificationScheduler() {
   if (morningSchedulerRunning) return;
   morningSchedulerRunning = true;
 
-  console.log("⏰ Scheduler de notificações matinais ativado (8h)");
+  console.log("⏰ Scheduler de notificações matinais ativado (9h)");
   console.log(
-    "⏰ Scheduler de lembretes ativado (a cada 3h, última 1h antes do jogo)",
+    "⏰ Scheduler de lembretes: 11h30, 14h, 17h, 20h + 1h antes do jogo",
   );
 
   // Verifica a cada minuto se é hora de enviar
@@ -1157,14 +1280,18 @@ function startMorningNotificationScheduler() {
     const hour = now.hour();
     const minute = now.minute();
 
-    // Envia às 8:00 da manhã
-    if (hour === 8 && minute === 0) {
+    // Envia às 9:00 da manhã
+    if (hour === 9 && minute === 0) {
       await sendMorningNotification();
     }
 
-    // Verifica lembretes a cada 3 horas (8h, 11h, 14h, 17h, 20h)
-    // e também 1h antes do primeiro jogo
-    if (minute === 0 && [8, 11, 14, 17, 20].includes(hour)) {
+    // Lembretes periódicos: 11h30, 14h, 17h, 20h
+    if (hour === 11 && minute === 30) {
+      console.log("🔔 Horário 11h30 - verificando lembrete...");
+      await sendReminderIfNeeded();
+    }
+    if (minute === 0 && [14, 17, 20].includes(hour)) {
+      console.log(`🔔 Horário ${hour}h - verificando lembrete...`);
       await sendReminderIfNeeded();
     }
   }, 60000); // Verifica a cada 1 minuto
@@ -1172,7 +1299,7 @@ function startMorningNotificationScheduler() {
   // Inicia scheduler especial para lembrete 1h antes do jogo
   startOneHourBeforeReminder();
 
-  // Verifica imediatamente se perdemos o horário de hoje
+  // Verifica se perdemos a notificação matinal
   checkIfShouldSendNow();
 }
 
@@ -1193,32 +1320,38 @@ function startOneHourBeforeReminder() {
 }
 
 /**
- * Verifica se falta 1h para o primeiro jogo e envia lembrete final
+ * Verifica se falta 1h para o PRIMEIRO jogo DO DIA e envia lembrete final
+ * (apenas uma vez por dia, antes do primeiro jogo)
  */
 async function checkOneHourBeforeGame() {
   if (!sock || !BOLAO_GROUP_ID) return;
 
   const now = dayjs();
-  const oneHourFromNow = now.add(1, "hour");
+  const todayStart = now.startOf("day");
+  const todayEnd = now.endOf("day");
 
-  // Busca o próximo jogo
-  const nextMatch = await prisma.match.findFirst({
+  // Busca o PRIMEIRO jogo DO DIA (não qualquer próximo jogo)
+  const firstGameOfDay = await prisma.match.findFirst({
     where: {
       status: "SCHEDULED",
-      matchDate: { gt: now.toDate() },
+      matchDate: {
+        gte: todayStart.toDate(),
+        lte: todayEnd.toDate(),
+      },
     },
     orderBy: { matchDate: "asc" },
   });
 
-  if (!nextMatch) return;
+  if (!firstGameOfDay) return;
 
-  const matchTime = dayjs(nextMatch.matchDate);
+  const matchTime = dayjs(firstGameOfDay.matchDate);
   const diffMinutes = matchTime.diff(now, "minute");
 
-  // Se falta entre 55 e 65 minutos (janela de 10 min para pegar o horário certo)
+  // Se falta entre 55 e 65 minutos para o PRIMEIRO jogo do dia
   if (diffMinutes >= 55 && diffMinutes <= 65) {
-    // Verifica se já enviamos esse lembrete
-    const reminderKey = `1H_BEFORE_${nextMatch.id}`;
+    // Verifica se já enviamos esse lembrete HOJE
+    const todayKey = now.format("YYYY-MM-DD");
+    const reminderKey = `1H_BEFORE_DAY_${todayKey}`;
     const alreadySent = await prisma.notification.findFirst({
       where: {
         type: reminderKey,
@@ -1226,7 +1359,19 @@ async function checkOneHourBeforeGame() {
     });
 
     if (!alreadySent) {
-      await sendFinalReminder(nextMatch.round);
+      await sendFinalReminder(firstGameOfDay.round);
+
+      // Marca que já enviamos o lembrete de 1h antes HOJE
+      await prisma.notification.create({
+        data: {
+          type: reminderKey,
+          sentAt: now.toDate(),
+        },
+      });
+
+      console.log(
+        `✅ Lembrete 1h antes enviado - primeiro jogo do dia: ${matchTime.format("HH:mm")}`,
+      );
     }
   }
 }
@@ -1253,24 +1398,35 @@ async function sendFinalReminder(round: number) {
 
   const firstMatch = matches[0];
 
-  // Busca quem falta palpitar
-  const allPlayers = await prisma.player.findMany();
-  const playersWhoBet = new Set(
-    matches.flatMap((m) => m.bets.map((b) => b.playerId)),
-  );
-  const pendingPlayers = allPlayers.filter((p) => !playersWhoBet.has(p.id));
+  // Conta membros do grupo que ainda não palpitaram
+  const pendingCount = await getPendingMembersCount(matches);
 
-  if (pendingPlayers.length === 0) return; // Todos já palpitaram
+  if (pendingCount === 0) return; // Todos já palpitaram
 
+  // Mensagem 1: Última chamada com jogos
   let message = `🚨 *ÚLTIMA CHAMADA!* 🚨\n\n`;
-  message += `⏰ Falta *1 HORA* para começar:\n`;
-  message += `🏟️ ${firstMatch.homeTeam} x ${firstMatch.awayTeam}\n\n`;
-  message += `📋 *Ainda faltam palpitar:*\n`;
-  message += pendingPlayers.map((p) => `• ${p.name}`).join("\n");
-  message += `\n\n⚠️ _Corram que ainda dá tempo!_\n`;
+  message += `⏰ Falta *1 HORA* para começar!\n\n`;
+  message += `⚽ *JOGOS DE HOJE:*\n`;
+  matches.forEach((match) => {
+    const time = dayjs(match.matchDate).format("HH[h]mm");
+    message += `⚽ ${match.homeTeam} x ${match.awayTeam} (${time})\n`;
+  });
+  message += `\n📋 *${pendingCount} pessoas ainda não palpitaram!*\n`;
+  message += `\n⚠️ _Corram que ainda dá tempo!_\n`;
   message += `⚠️ _Lembre-se: depois de enviado, não é possível alterar!_`;
 
   await sock.sendMessage(BOLAO_GROUP_ID, { text: message });
+
+  // Aguarda 1 segundo antes de enviar a segunda mensagem
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+
+  // Mensagem 2: Lista para copiar
+  let copyMessage = matches
+    .map((match) => `${match.homeTeam} x ${match.awayTeam}`)
+    .join("\n");
+  copyMessage += `\n\n💡 _Copie, altere os placares e envie aqui!_`;
+
+  await sock.sendMessage(BOLAO_GROUP_ID, { text: copyMessage });
 
   // Registra que enviamos
   await prisma.notification.create({
@@ -1288,18 +1444,28 @@ async function sendFinalReminder(round: number) {
  * Envia lembrete se ainda há pessoas que não palpitaram
  */
 async function sendReminderIfNeeded() {
-  if (!sock || !BOLAO_GROUP_ID) return;
+  console.log("🔍 sendReminderIfNeeded: iniciando verificação...");
+
+  if (!sock) {
+    console.log("⚠️ sendReminderIfNeeded: sock não disponível");
+    return;
+  }
+
+  if (!BOLAO_GROUP_ID) {
+    console.log("⚠️ sendReminderIfNeeded: BOLAO_GROUP_ID não configurado");
+    return;
+  }
 
   const now = dayjs();
   const todayStart = now.startOf("day").toDate();
   const todayEnd = now.endOf("day").toDate();
 
-  // Busca jogos de hoje ainda não começados
+  // Busca TODOS os jogos de hoje (status SCHEDULED)
   const matchesToday = await prisma.match.findMany({
     where: {
       status: "SCHEDULED",
       matchDate: {
-        gte: now.toDate(), // Apenas jogos que ainda não começaram
+        gte: todayStart,
         lte: todayEnd,
       },
     },
@@ -1309,54 +1475,92 @@ async function sendReminderIfNeeded() {
     orderBy: { matchDate: "asc" },
   });
 
-  if (matchesToday.length === 0) return;
+  console.log(`🔍 sendReminderIfNeeded: ${matchesToday.length} jogos hoje`);
 
-  // Busca quem falta palpitar
-  const allPlayers = await prisma.player.findMany();
-  const playersWhoBet = new Set(
-    matchesToday.flatMap((m) => m.bets.map((b) => b.playerId)),
-  );
-  const pendingPlayers = allPlayers.filter((p) => !playersWhoBet.has(p.id));
+  if (matchesToday.length === 0) {
+    console.log("⚠️ sendReminderIfNeeded: sem jogos hoje, não envia");
+    return;
+  }
 
-  if (pendingPlayers.length === 0) return; // Todos já palpitaram
+  // Conta membros do grupo que ainda não palpitaram
+  const pendingCount = await getPendingMembersCount(matchesToday);
 
-  // Verifica se já enviamos lembrete nessa hora
-  const hourKey = now.format("YYYY-MM-DD-HH");
+  console.log(`🔍 sendReminderIfNeeded: ${pendingCount} membros pendentes`);
+
+  if (pendingCount === 0) {
+    console.log("✅ sendReminderIfNeeded: todos os membros já palpitaram!");
+    return;
+  }
+
+  // Verifica se já enviamos lembrete nessa hora (evita duplicidade)
   const alreadySent = await prisma.notification.findFirst({
     where: {
-      type: `REMINDER_${hourKey}`,
+      type: { startsWith: `REMINDER_${now.format("YYYY-MM-DD-HH")}` },
     },
   });
 
-  if (alreadySent) return;
+  if (alreadySent) {
+    console.log(`⚠️ sendReminderIfNeeded: já enviamos lembrete nessa hora`);
+    return;
+  }
 
   const firstMatch = matchesToday[0];
-  const timeToGame = dayjs(firstMatch.matchDate).diff(now, "hour");
+  const matchTime = dayjs(firstMatch.matchDate);
+  const diffHours = matchTime.diff(now, "hour");
+  const diffMinutes = matchTime.diff(now, "minute") % 60;
 
+  let timeText = "";
+  if (diffHours > 0) {
+    timeText = `~${diffHours}h${diffMinutes > 0 ? diffMinutes + "min" : ""}`;
+  } else if (diffMinutes > 0) {
+    timeText = `~${diffMinutes} minutos`;
+  } else {
+    timeText = "em breve";
+  }
+
+  // Mensagem 1: Lembrete com jogos
   let message = `⏰ *LEMBRETE DE PALPITES*\n\n`;
-  message += `🏟️ Próximo jogo em ~${timeToGame}h:\n`;
-  message += `${firstMatch.homeTeam} x ${firstMatch.awayTeam}\n\n`;
-  message += `📋 *Ainda faltam palpitar:*\n`;
-  message += pendingPlayers.map((p) => `• ${p.name}`).join("\n");
-  message += `\n\n📝 _Enviem seus palpites!_\n`;
+  message += `🏟️ Primeiro jogo em ${timeText}\n\n`;
+  message += `⚽ *JOGOS DE HOJE:*\n`;
+  matchesToday.forEach((match) => {
+    const time = dayjs(match.matchDate).format("HH[h]mm");
+    message += `⚽ ${match.homeTeam} x ${match.awayTeam} (${time})\n`;
+  });
+  message += `\n📋 *${pendingCount} pessoas ainda não palpitaram!*\n`;
+  message += `\n📝 _Enviem seus palpites!_\n`;
   message += `⚠️ _Lembre-se: palpites não podem ser alterados depois de enviados._`;
 
-  await sock.sendMessage(BOLAO_GROUP_ID, { text: message });
+  try {
+    await sock.sendMessage(BOLAO_GROUP_ID, { text: message });
 
-  // Registra que enviamos
-  await prisma.notification.create({
-    data: {
-      type: `REMINDER_${hourKey}`,
-      sentAt: new Date(),
-      groupId: BOLAO_GROUP_ID,
-    },
-  });
+    // Aguarda 1 segundo antes de enviar a segunda mensagem
+    await new Promise((resolve) => setTimeout(resolve, 1000));
 
-  console.log(`✅ Lembrete enviado (${pendingPlayers.length} pendentes)`);
+    // Mensagem 2: Lista para copiar
+    let copyMessage = matchesToday
+      .map((match) => `${match.homeTeam} x ${match.awayTeam}`)
+      .join("\n");
+    copyMessage += `\n\n💡 _Copie, altere os placares e envie aqui!_`;
+
+    await sock.sendMessage(BOLAO_GROUP_ID, { text: copyMessage });
+
+    // Registra que enviamos
+    await prisma.notification.create({
+      data: {
+        type: `REMINDER_${now.format("YYYY-MM-DD-HH")}`,
+        sentAt: new Date(),
+        groupId: BOLAO_GROUP_ID,
+      },
+    });
+
+    console.log(`✅ Lembrete enviado! (${pendingMembers.length} pendentes)`);
+  } catch (error) {
+    console.error("❌ Erro ao enviar lembrete:", error);
+  }
 }
 
 /**
- * Verifica se deveria ter enviado hoje (útil se o bot reiniciar após as 8h)
+ * Verifica se deveria ter enviado hoje (útil se o bot reiniciar após as 9h)
  */
 async function checkIfShouldSendNow() {
   const now = dayjs();
@@ -1376,8 +1580,8 @@ async function checkIfShouldSendNow() {
     },
   });
 
-  // Se há jogos hoje e já passou das 8h, verifica se já notificamos
-  if (matchesToday && now.hour() >= 8) {
+  // Se há jogos hoje e já passou das 9h, verifica se já notificamos
+  if (matchesToday && now.hour() >= 9) {
     const lastNotification = await prisma.notification.findFirst({
       where: {
         type: "MORNING_GAMES",
@@ -1457,20 +1661,20 @@ async function sendMorningNotification() {
   message += `\n📝 *Enviem seus palpites!*\n`;
   message += `_Lembrando: palpite só vale se enviado ANTES do jogo começar!_\n\n`;
   message += `⚠️ *ATENÇÃO: Uma vez enviado, o palpite NÃO PODE ser alterado!*\n`;
-  message += `_Confira bem antes de enviar._\n\n`;
+  message += `_Confira bem antes de enviar._`;
 
-  // Gera exemplo com os times do dia
-  message += `*Exemplo de palpite:*\n`;
-  for (const match of matchesToday) {
-    const homeScore = Math.floor(Math.random() * 3);
-    const awayScore = Math.floor(Math.random() * 3);
-    message += `${match.homeTeam} ${homeScore} x ${awayScore} ${match.awayTeam}\n`;
-  }
-
-  message += `\n💡 _Copie, altere os placares e envie aqui!_`;
-
-  // Envia a mensagem
+  // Envia primeira mensagem com as informações completas
   await sock.sendMessage(BOLAO_GROUP_ID, { text: message });
+
+  // Monta segunda mensagem apenas com os jogos para copiar
+  let copyMessage = ``;
+  for (const match of matchesToday) {
+    copyMessage += `${match.homeTeam} x ${match.awayTeam}\n`;
+  }
+  copyMessage += `\n💡 _Copie, altere os placares e envie aqui!_`;
+
+  // Envia segunda mensagem com lista para copiar
+  await sock.sendMessage(BOLAO_GROUP_ID, { text: copyMessage });
 
   // Registra que enviamos a notificação
   await prisma.notification.create({
@@ -2160,4 +2364,57 @@ async function sendFinalResultNotification(
 export async function forceSync(): Promise<string> {
   const result = await syncTodayGames();
   return `Sincronização completa: ${result.added} novos jogos, ${result.updated} atualizados`;
+}
+
+/**
+ * Servidor HTTP interno para receber comandos do painel admin
+ */
+function startInternalHttpServer() {
+  const BOT_API_PORT = process.env.BOT_API_PORT || 3335;
+
+  const server = http.createServer(async (req, res) => {
+    res.setHeader("Content-Type", "application/json");
+
+    // Rota para enviar ranking parcial
+    if (req.method === "POST" && req.url?.startsWith("/send-partial-ranking")) {
+      try {
+        const urlParams = new URL(req.url, `http://localhost:${BOT_API_PORT}`);
+        const round = parseInt(urlParams.searchParams.get("round") || "0");
+
+        if (!sock || !BOLAO_GROUP_ID) {
+          res.statusCode = 503;
+          res.end(JSON.stringify({ error: "WhatsApp não conectado" }));
+          return;
+        }
+
+        await sendCurrentRoundStatus(BOLAO_GROUP_ID);
+        console.log(`📊 Ranking parcial da rodada ${round} enviado via API`);
+        res.end(JSON.stringify({ success: true, round }));
+      } catch (error) {
+        console.error("Erro ao enviar ranking:", error);
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: "Erro interno" }));
+      }
+      return;
+    }
+
+    // Rota de health check
+    if (req.method === "GET" && req.url === "/health") {
+      res.end(
+        JSON.stringify({
+          status: "ok",
+          whatsapp: !!sock,
+          group: !!BOLAO_GROUP_ID,
+        }),
+      );
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end(JSON.stringify({ error: "Not found" }));
+  });
+
+  server.listen(BOT_API_PORT, () => {
+    console.log(`🔌 API interna do bot rodando na porta ${BOT_API_PORT}`);
+  });
 }

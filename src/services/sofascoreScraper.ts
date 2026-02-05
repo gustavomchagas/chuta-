@@ -82,7 +82,14 @@ async function getBrowser(): Promise<Browser> {
         "--disable-accelerated-2d-canvas",
         "--disable-gpu",
         "--window-size=1920x1080",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-features=VizDisplayCompositor",
+        "--disable-web-security",
+        "--disable-infobars",
       ],
+      executablePath: "/usr/bin/google-chrome-stable",
+      timeout: 60000,
+      protocolTimeout: 120000,
     });
   }
   return browserInstance;

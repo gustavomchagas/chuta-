@@ -1,0 +1,7 @@
+[DEFAULT]
+user=ocid1.user.oc1..aaaaaaaalqgjxetkdx2f3wm63ovuzvxywx564dnm5nnv5eb2f7gzekkfplqa
+fingerprint=4e:17:6c:18:d6:af:a4:d1:8f:bb:78:29:69:dd:ca:1c
+key_file=C:\Users\Gustavo\Documents\.ssh\oci_api_key.pem
+tenancy=ocid1.tenancy.oc1..aaaaaaaannz4snam6r5asxx24c2u3i2wdp2kdaxzdnn5by4i6l5vd2vmfrqq
+region=sa-saopaulo-1
+

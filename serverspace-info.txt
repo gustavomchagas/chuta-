@@ -1,0 +1,13 @@
+﻿Servidor Server Space - Chutai Bot
+===================================
+IP: 92.246.129.3
+Usuario: root
+Diretorio: /opt/chutai
+DB Password: ztQSaULHiNA02umGsk58
+Data Deploy: 03/02/2026 22:03:09
+
+Comandos Uteis:
+- Ver logs: & 'C:\Users\Gustavo\AppData\Local\Temp\plink.exe' -i 'C:\Users\Gustavo\Documents\.ssh\chutai-vps.ppk' -hostkey 'SHA256:rKV1icKuFRtnZH/5WZhMXv3SVpDy8C8kMezI7P/mQss' root@92.246.129.3 'pm2 logs chutai-bot'
+- Status: & 'C:\Users\Gustavo\AppData\Local\Temp\plink.exe' -i 'C:\Users\Gustavo\Documents\.ssh\chutai-vps.ppk' -hostkey 'SHA256:rKV1icKuFRtnZH/5WZhMXv3SVpDy8C8kMezI7P/mQss' root@92.246.129.3 'pm2 status'
+- Reiniciar: & 'C:\Users\Gustavo\AppData\Local\Temp\plink.exe' -i 'C:\Users\Gustavo\Documents\.ssh\chutai-vps.ppk' -hostkey 'SHA256:rKV1icKuFRtnZH/5WZhMXv3SVpDy8C8kMezI7P/mQss' root@92.246.129.3 'pm2 restart chutai-bot'
+- Conectar: & 'C:\Users\Gustavo\AppData\Local\Temp\plink.exe' -i 'C:\Users\Gustavo\Documents\.ssh\chutai-vps.ppk' -hostkey 'SHA256:rKV1icKuFRtnZH/5WZhMXv3SVpDy8C8kMezI7P/mQss' root@92.246.129.3

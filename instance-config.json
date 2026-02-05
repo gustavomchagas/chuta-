@@ -1,0 +1,18 @@
+{
+  "compartmentId": "ocid1.tenancy.oc1..aaaaaaaannz4snam6r5asxx24c2u3i2wdp2kdaxzdnn5by4i6l5vd2vmfrqq",
+  "availabilityDomain": "bUbN:SA-SAOPAULO-1-AD-1",
+  "shape": "VM.Standard.A1.Flex",
+  "shapeConfig": {
+    "ocpus": 4,
+    "memoryInGBs": 24
+  },
+  "displayName": "chutai-bot",
+  "imageId": "ocid1.image.oc1.sa-saopaulo-1.aaaaaaaa2p4kpj2zvnjlzc64h27xiddnhr5pdmrcph7rtp3d5cqnr65d7mza",
+  "createVnicDetails": {
+    "subnetId": "ocid1.subnet.oc1.sa-saopaulo-1.aaaaaaaau3ird5qhiovhcpmoopyihmvkyz4mb2urr7aufubh6ksuwhl77i5a",
+    "assignPublicIp": true
+  },
+  "metadata": {
+    "ssh_authorized_keys": "PLACEHOLDER_SSH_KEY"
+  }
+}

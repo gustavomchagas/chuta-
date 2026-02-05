@@ -1050,9 +1050,22 @@
         <!-- Ranking Tab -->
         <div class="tab-pane fade" id="ranking" role="tabpanel">
           <div class="card">
-            <div class="card-header">
-              <i class="bi bi-trophy"></i>
-              Ranking Geral
+            <div
+              class="card-header d-flex justify-content-between align-items-center"
+            >
+              <span><i class="bi bi-trophy"></i> Ranking</span>
+              <select
+                id="roundFilter"
+                class="form-select form-select-sm"
+                style="
+                  width: auto;
+                  background-color: #1f2937;
+                  color: #f9fafb;
+                  border-color: #374151;
+                "
+              >
+                <option value="geral">🏆 Geral</option>
+              </select>
             </div>
             <div class="card-body" id="rankingList">
               <div class="empty-state">
@@ -1123,6 +1136,7 @@
         loadStats();
         loadGames();
         loadPendingResults();
+        loadRoundsFilter();
         loadRanking();
       });
 
@@ -1268,14 +1282,43 @@
         }
       }
 
-      // Carregar ranking
-      async function loadRanking() {
+      // Carregar rodadas para o filtro
+      async function loadRoundsFilter() {
+        const select = document.getElementById("roundFilter");
+        try {
+          const response = await fetch(`${API_URL}/api/rounds`);
+          if (response.ok) {
+            const rounds = await response.json();
+            // Mantém a opção "Geral"
+            let options = '<option value="geral">🏆 Geral</option>';
+            rounds.forEach((r) => {
+              const status = r.isComplete
+                ? "✅"
+                : `${r.finishedMatches}/${r.totalMatches}`;
+              options += `<option value="${r.round}">Rodada ${r.round} ${status}</option>`;
+            });
+            select.innerHTML = options;
+          }
+        } catch (error) {
+          console.error("Erro ao carregar rodadas:", error);
+        }
+      }
+
+      // Carregar ranking (geral ou por rodada)
+      async function loadRanking(round = "geral") {
         const container = document.getElementById("rankingList");
         try {
-          const response = await fetch(`${API_URL}/api/ranking`);
+          const url =
+            round === "geral"
+              ? `${API_URL}/api/ranking`
+              : `${API_URL}/api/ranking/${round}`;
+
+          const response = await fetch(url);
           if (response.ok) {
-            const ranking = await response.json();
-            if (ranking.length === 0) {
+            const data = await response.json();
+            const ranking = round === "geral" ? data : data.ranking;
+
+            if (!ranking || ranking.length === 0) {
               container.innerHTML = `
                             <div class="empty-state">
                                 <i class="bi bi-emoji-neutral"></i>
@@ -1285,32 +1328,48 @@
                         `;
               return;
             }
-            container.innerHTML = ranking
-              .map((player, index) => {
-                let positionClass = "default";
-                if (index === 0) positionClass = "gold";
-                else if (index === 1) positionClass = "silver";
-                else if (index === 2) positionClass = "bronze";
 
-                return `
+            // Header com info da rodada
+            let header = "";
+            if (round !== "geral" && data.round) {
+              header = `<div class="alert alert-info mb-3" style="background: rgba(59, 130, 246, 0.1); border-color: #3b82f6; color: #93c5fd;">
+                <strong>Rodada ${data.round}</strong> - ${data.finishedMatches}/${data.totalMatches} jogos finalizados
+              </div>`;
+            }
+
+            container.innerHTML =
+              header +
+              ranking
+                .map((player, index) => {
+                  let positionClass = "default";
+                  if (index === 0) positionClass = "gold";
+                  else if (index === 1) positionClass = "silver";
+                  else if (index === 2) positionClass = "bronze";
+
+                  return `
                             <div class="ranking-item fade-in">
                                 <div class="ranking-position ${positionClass}">${index + 1}º</div>
                                 <div class="ranking-name">
-                                    ${player.name}
-                                    <small class="text-muted d-block">
-                                        ${player.exact_scores || 0} exatos · ${player.correct_results || 0} acertos
+                                    ${player.displayName || player.name}
+                                    <small class="d-block" style="color: #9ca3af; font-size: 0.875rem;">
+                                        ${player.exactScores || 0} exatos · ${player.correctWinners || 0} acertos
                                     </small>
                                 </div>
-                                <div class="ranking-points">${player.total_points} pts</div>
+                                <div class="ranking-points">${player.totalPoints || 0} pts</div>
                             </div>
                         `;
-              })
-              .join("");
+                })
+                .join("");
           }
         } catch (error) {
           console.error("Erro ao carregar ranking:", error);
         }
       }
+
+      // Event listener para filtro de rodadas
+      document.getElementById("roundFilter").addEventListener("change", (e) => {
+        loadRanking(e.target.value);
+      });
 
       // Adicionar jogo
       document
