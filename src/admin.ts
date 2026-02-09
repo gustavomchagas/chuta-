@@ -428,17 +428,6 @@ app.get("/api/sofascore/test", async () => {
   return result;
 });
 
-// Lista todos os jogadores
-app.get("/api/players", async () => {
-  const players = await prisma.player.findMany({
-    include: {
-      _count: { select: { bets: true } },
-    },
-    orderBy: { name: "asc" },
-  });
-  return players;
-});
-
 // Ranking geral
 app.get("/api/ranking", async () => {
   const players = await prisma.player.findMany({
@@ -693,4 +682,115 @@ app.listen({ port: Number(PORT), host: "0.0.0.0" }, (err, address) => {
     process.exit(1);
   }
   console.log(`🎛️  Painel Admin rodando em ${address}`);
+});
+
+// Rota para buscar palpites com filtros
+app.get("/api/guesses", async (request, reply) => {
+  const { userId, round } = request.query as {
+    userId?: string;
+    round?: string;
+  };
+
+  const whereClause: any = {};
+
+  // 1. CORREÇÃO: Se a tabela é 'Player', o campo de ligação é 'playerId'
+  if (userId) whereClause.playerId = userId;
+
+  // 2. CORREÇÃO: Se a tabela é 'Match', a relação é 'match'
+  if (round) {
+    whereClause.match = { round: parseInt(round) };
+  }
+
+  try {
+    const bets = await prisma.bet.findMany({
+      where: whereClause,
+      include: {
+        match: true, // <--- Agora está alinhado com a tabela Match
+        player: true, // <--- Agora está alinhado com a tabela Player
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+    const processedBets = bets.map((bet) => {
+      const gameData = bet.match;
+      const playerData = bet.player;
+
+      let status = "AGUARDANDO";
+      let points = 0;
+
+      // Verifica se o jogo terminou e tem placar
+      if (
+        gameData &&
+        gameData.status === "FINISHED" &&
+        gameData.homeScore !== null &&
+        gameData.awayScore !== null
+      ) {
+        const realHome = gameData.homeScore;
+        const realAway = gameData.awayScore;
+        const palpiteHome = bet.homeScoreGuess;
+        const palpiteAway = bet.awayScoreGuess;
+
+        if (realHome === palpiteHome && realAway === palpiteAway) {
+          status = "CRAVOU";
+          points = 2;
+        } else if (
+          (realHome > realAway && palpiteHome > palpiteAway) ||
+          (realAway > realHome && palpiteAway > palpiteHome) ||
+          (realHome === realAway && palpiteHome === palpiteAway)
+        ) {
+          status = "ACERTOU_RESULTADO";
+          points = 1;
+        } else {
+          status = "ERROU";
+        }
+      }
+
+      return {
+        ...bet,
+        // Garante que o frontend receba os objetos preenchidos
+        match: gameData,
+        player: playerData,
+        homeScore: bet.homeScoreGuess,
+        awayScore: bet.awayScoreGuess,
+        status,
+        points: bet.points !== null ? bet.points : points,
+      };
+    });
+
+    return processedBets;
+  } catch (error) {
+    console.error("ERRO AO BUSCAR PALPITES:", error);
+    // Retorna lista vazia em caso de erro para não travar a tela
+    return [];
+  }
+});
+
+app.get("/api/players", async (request, reply) => {
+  try {
+    const players = await prisma.player.findMany({
+      orderBy: { name: "asc" },
+      select: {
+        id: true,
+        name: true,
+        // Não selecionamos 'phone' para garantir que não apareça
+      },
+    });
+
+    // Filtra para remover qualquer coisa entre parênteses que venha do banco
+    const cleanPlayers = players.map((p) => {
+      // Remove sufixos como (lid:xxxxx) ou (12345) do nome
+      const cleanName = p.name.replace(/\s*\(.*?\).*$/, "").trim();
+      return {
+        id: p.id,
+        name: cleanName,
+      };
+    });
+
+    return cleanPlayers;
+  } catch (error) {
+    console.error("Erro ao listar jogadores:", error);
+    return [];
+  }
 });
