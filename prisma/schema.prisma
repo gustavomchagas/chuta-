@@ -32,19 +32,20 @@ model Group {
 }
 
 model Match {
-  id        String      @id @default(uuid())
-  groupId   String?     @map("group_id")
-  round     Int
-  homeTeam  String      @map("home_team")
-  awayTeam  String      @map("away_team")
-  matchDate DateTime    @map("match_date")
-  homeScore Int?        @map("home_score")
-  awayScore Int?        @map("away_score")
-  status    MatchStatus @default(SCHEDULED)
-  createdAt DateTime    @default(now()) @map("created_at")
-  updatedAt DateTime    @updatedAt @map("updated_at")
-  bets      Bet[]
-  group     Group?      @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  id            String      @id @default(uuid())
+  groupId       String?     @map("group_id")
+  round         Int
+  homeTeam      String      @map("home_team")
+  awayTeam      String      @map("away_team")
+  matchDate     DateTime    @map("match_date")
+  homeScore     Int?        @map("home_score")
+  awayScore     Int?        @map("away_score")
+  status        MatchStatus @default(SCHEDULED)
+  postponedFrom String?     @map("postponed_from") // Armazena "R2", "R5", etc se for jogo adiado
+  createdAt     DateTime    @default(now()) @map("created_at")
+  updatedAt     DateTime    @updatedAt @map("updated_at")
+  bets          Bet[]
+  group         Group?      @relation(fields: [groupId], references: [id], onDelete: Cascade)
 
   @@map("matches")
 }

@@ -115,7 +115,7 @@ export interface GameData {
   round: number;
   homeScore: number | null;
   awayScore: number | null;
-  status: "SCHEDULED" | "LIVE" | "FINISHED";
+  status: "SCHEDULED" | "LIVE" | "FINISHED" | "POSTPONED" | "CANCELLED";
 }
 
 /**
@@ -128,7 +128,9 @@ function normalizeTeamName(name: string): string {
 /**
  * Converte status do SofaScore para nosso sistema
  */
-function convertStatus(statusCode: number): "SCHEDULED" | "LIVE" | "FINISHED" {
+function convertStatus(
+  statusCode: number,
+): "SCHEDULED" | "LIVE" | "FINISHED" | "POSTPONED" | "CANCELLED" {
   // Status codes do SofaScore:
   // 0 = Not started
   // 6, 7 = 1st half, 2nd half (live)
@@ -137,7 +139,11 @@ function convertStatus(statusCode: number): "SCHEDULED" | "LIVE" | "FINISHED" {
   // 60 = Postponed
   // 70 = Cancelled
 
-  if (statusCode === 0 || statusCode === 60 || statusCode === 70) {
+  if (statusCode === 60) {
+    return "POSTPONED";
+  } else if (statusCode === 70) {
+    return "CANCELLED";
+  } else if (statusCode === 0) {
     return "SCHEDULED";
   } else if (statusCode === 100) {
     return "FINISHED";

@@ -22,7 +22,7 @@ let partialRankingTimer: NodeJS.Timeout | null = null;
  * Adiciona sufixo do telefone ao nome quando há jogadores com mesmo nome
  */
 async function addDisplayNames<
-  T extends { id: number; name: string; phone: string },
+  T extends { id: string | number; name: string; phone: string },
 >(players: T[]): Promise<(T & { displayName: string })[]> {
   // Agrupa jogadores por nome (case insensitive)
   const nameGroups = new Map<string, T[]>();
@@ -234,6 +234,34 @@ app.delete("/api/matches/:id", async (request) => {
   const { id } = request.params as { id: string };
   await prisma.match.delete({ where: { id } });
   return { success: true };
+});
+
+// Lista jogadores
+app.get("/api/players", async (request, reply) => {
+  try {
+    const players = await prisma.player.findMany({
+      orderBy: { name: "asc" },
+      select: {
+        id: true,
+        name: true,
+      },
+    });
+
+    // Filtra para remover qualquer coisa entre parênteses que venha do banco
+    const cleanPlayers = players.map((p) => {
+      // Remove sufixos como (lid:xxxxx) ou (12345) do nome
+      const cleanName = p.name.replace(/\s*\(.*?\).*$/, "").trim();
+      return {
+        id: p.id,
+        name: cleanName,
+      };
+    });
+
+    return cleanPlayers;
+  } catch (error) {
+    console.error("Erro ao listar jogadores:", error);
+    return [];
+  }
 });
 
 // ============================================
@@ -498,7 +526,7 @@ app.get("/api/ranking/:round", async (request) => {
   const playerStats = new Map<
     string,
     {
-      id: number;
+      id: string;
       name: string;
       phone: string;
       totalPoints: number;
@@ -620,6 +648,37 @@ function calculatePoints(
 }
 
 // ============================================
+// ENVIAR LEMBRETE MANUAL
+// ============================================
+
+/**
+ * Envia lembrete manual para o grupo do WhatsApp
+ */
+app.post("/api/send-reminder", async (request, reply) => {
+  try {
+    const BOT_API_URL = process.env.BOT_API_URL || "http://localhost:3335";
+
+    const response = await fetch(`${BOT_API_URL}/send-reminder`, {
+      method: "POST",
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      console.error("Erro ao enviar lembrete via API:", error);
+      reply.code(500).send({ error: "Erro ao enviar lembrete" });
+      return;
+    }
+
+    const result = await response.json();
+    console.log("🔔 Lembrete manual enviado com sucesso");
+    reply.send(result);
+  } catch (error) {
+    console.error("Erro ao enviar lembrete:", error);
+    reply.code(500).send({ error: "Erro interno" });
+  }
+});
+
+// ============================================
 // RANKING PARCIAL AUTOMÁTICO
 // ============================================
 
@@ -669,20 +728,6 @@ async function sendPartialRanking(round: number) {
     console.error("Erro ao conectar com API do bot:", error);
   }
 }
-
-// ============================================
-// SERVIDOR
-// ============================================
-
-const PORT = process.env.ADMIN_PORT || 3334;
-
-app.listen({ port: Number(PORT), host: "0.0.0.0" }, (err, address) => {
-  if (err) {
-    console.error(err);
-    process.exit(1);
-  }
-  console.log(`🎛️  Painel Admin rodando em ${address}`);
-});
 
 // Rota para buscar palpites com filtros
 app.get("/api/guesses", async (request, reply) => {
@@ -767,30 +812,16 @@ app.get("/api/guesses", async (request, reply) => {
   }
 });
 
-app.get("/api/players", async (request, reply) => {
-  try {
-    const players = await prisma.player.findMany({
-      orderBy: { name: "asc" },
-      select: {
-        id: true,
-        name: true,
-        // Não selecionamos 'phone' para garantir que não apareça
-      },
-    });
+// ============================================
+// SERVIDOR
+// ============================================
 
-    // Filtra para remover qualquer coisa entre parênteses que venha do banco
-    const cleanPlayers = players.map((p) => {
-      // Remove sufixos como (lid:xxxxx) ou (12345) do nome
-      const cleanName = p.name.replace(/\s*\(.*?\).*$/, "").trim();
-      return {
-        id: p.id,
-        name: cleanName,
-      };
-    });
+const PORT = process.env.ADMIN_PORT || 3334;
 
-    return cleanPlayers;
-  } catch (error) {
-    console.error("Erro ao listar jogadores:", error);
-    return [];
+app.listen({ port: Number(PORT), host: "0.0.0.0" }, (err, address) => {
+  if (err) {
+    console.error(err);
+    process.exit(1);
   }
+  console.log(`🎛️  Painel Admin rodando em ${address}`);
 });

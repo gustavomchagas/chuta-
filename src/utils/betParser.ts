@@ -53,6 +53,7 @@ export function parseBets(message: string, roundMatches: Match[]): ParseResult {
   const strategies = [
     parseNumberedFormat,
     parseTeamNameFormat,
+    parseAlternateTeamFormat,
     parseMixedFormat,
     parseCompactFormat,
   ];
@@ -195,6 +196,62 @@ function parseTeamNameFormat(
               : "medium",
           originalText: match[0],
         });
+      }
+    }
+  }
+
+  return { bets, errors };
+}
+
+/**
+ * Formato alternativo com times: "Time x Time Placar"
+ * Exemplo: "Vitória x Flamengo 1x3" ou "Chape x Coritiba 0-2"
+ */
+function parseAlternateTeamFormat(
+  message: string,
+  matches: Match[],
+): { bets: ParsedBet[]; errors: string[] } {
+  const bets: ParsedBet[] = [];
+  const errors: string[] = [];
+
+  // Regex para capturar: time1 + "x" + time2 + placar
+  // Padrão: "Vitória x Flamengo 1x3" ou "Chape x Coritiba 0-2"
+  const pattern =
+    /([a-záàâãéèêíïóôõöúçñ\-\s]+)\s+x\s+([a-záàâãéèêíïóôõöúçñ\-\s]+)\s+(\d+)\s*[xX\-]\s*(\d+)/gi;
+
+  let match;
+  while ((match = pattern.exec(message)) !== null) {
+    const team1Text = match[1].trim();
+    const team2Text = match[2].trim();
+    const homeScore = parseInt(match[3]);
+    const awayScore = parseInt(match[4]);
+
+    // Tenta encontrar os times
+    const team1 = findTeamName(team1Text) || findClosestTeam(team1Text);
+    const team2 = findTeamName(team2Text) || findClosestTeam(team2Text);
+
+    if (team1 && team2) {
+      // Procura o jogo correspondente (time1 é mandante, time2 é visitante)
+      const roundMatch = matches.find(
+        (m) => m.homeTeam === team1 && m.awayTeam === team2,
+      );
+
+      if (roundMatch) {
+        bets.push({
+          matchId: roundMatch.id,
+          matchNumber: roundMatch.number,
+          homeTeam: roundMatch.homeTeam,
+          awayTeam: roundMatch.awayTeam,
+          homeScore,
+          awayScore,
+          confidence:
+            findTeamName(team1Text) && findTeamName(team2Text)
+              ? "high"
+              : "medium",
+          originalText: match[0],
+        });
+      } else {
+        errors.push(`Não encontrado: ${team1} x ${team2}`);
       }
     }
   }
