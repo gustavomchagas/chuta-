@@ -1,4 +1,3 @@
-# Script para iniciar bot e mostrar QR Code
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  Iniciando Bot - Aguardando QR Code" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan

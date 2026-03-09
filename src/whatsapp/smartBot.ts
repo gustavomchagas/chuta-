@@ -2,6 +2,7 @@ import "dotenv/config";
 import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
+  fetchLatestBaileysVersion,
   WASocket,
   proto,
 } from "@whiskeysockets/baileys";
@@ -158,10 +159,15 @@ export async function initBot() {
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
 
+  // Busca a versão mais recente do WhatsApp Web
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  console.log(`📱 Usando WhatsApp Web v${version.join(".")}`);
+
   sock = makeWASocket({
+    version, // Injeta a versão aqui!
     auth: state,
     printQRInTerminal: false,
-    browser: ["Chutaí Bot", "Safari", "3.0"],
+    browser: ["Ubuntu", "Chrome", "20.0.04"],
     syncFullHistory: false,
   });
 

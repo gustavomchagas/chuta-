@@ -5,9 +5,9 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Este script vai:" -ForegroundColor Yellow
 Write-Host "1. Parar o bot no servidor" -ForegroundColor White
-Write-Host "2. Deletar a sessão antiga" -ForegroundColor White
-Write-Host "3. Iniciar o bot LOCALMENTE" -ForegroundColor White
-Write-Host "4. Mostrar QR Code para escanear" -ForegroundColor White
+Write-Host "2. Deletar a sessão antiga NO SERVIDOR" -ForegroundColor White
+Write-Host "3. Deletar a sessão antiga LOCALMENTE" -ForegroundColor White
+Write-Host "4. Iniciar o bot LOCALMENTE para mostrar o QR Code" -ForegroundColor White
 Write-Host ""
 
 $confirm = Read-Host "Deseja continuar? (s/n)"
@@ -27,13 +27,24 @@ $hostkey = "SHA256:rKV1icKuFRtnZH/5WZhMXv3SVpDy8C8kMezI7P/mQss"
 
 Write-Host "   Bot parado!" -ForegroundColor Green
 Write-Host ""
-Write-Host "2. Deletando sessão antiga..." -ForegroundColor Yellow
+Write-Host "2. Deletando sessão antiga no servidor..." -ForegroundColor Yellow
 
 & $plink -i $ppk -hostkey $hostkey root@92.246.129.3 "rm -rf /opt/chutai/auth_info_baileys"
 
-Write-Host "   Sessão deletada!" -ForegroundColor Green
+Write-Host "   Sessão do servidor deletada!" -ForegroundColor Green
 Write-Host ""
-Write-Host "3. Iniciando bot LOCALMENTE..." -ForegroundColor Yellow
+Write-Host "3. Deletando sessão antiga localmente..." -ForegroundColor Yellow
+
+if (Test-Path ".\auth_info_baileys") {
+    Remove-Item -Recurse -Force ".\auth_info_baileys"
+    Write-Host "   Sessão local deletada!" -ForegroundColor Green
+}
+else {
+    Write-Host "   Nenhuma sessão local encontrada." -ForegroundColor DarkGray
+}
+
+Write-Host ""
+Write-Host "4. Iniciando bot LOCALMENTE..." -ForegroundColor Yellow
 Write-Host "   O QR Code vai aparecer abaixo:" -ForegroundColor White
 Write-Host ""
 
@@ -50,5 +61,5 @@ Get-Content $envPath | ForEach-Object {
     }
 }
 
-# Executar o bot localmente (desabilita checks de null estritos do TypeScript)
+# Executar o bot localmente
 npx ts-node --transpileOnly src/bot.ts
