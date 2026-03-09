@@ -2228,6 +2228,30 @@ async function sendMorningNotification() {
       return;
     }
 
+    // ==========================================
+    // NOVA LÓGICA: Verifica se ainda faltam palpites
+    // ==========================================
+    const pendingPlayers = await getPendingPlayers(allMatchesToNotify);
+
+    if (pendingPlayers.length === 0) {
+      console.log(
+        "✅ Todos os membros já palpitaram! Pulando notificação matinal do dia seguinte.",
+      );
+
+      // Precisamos registrar que a notificação foi "processada" no banco
+      // para o bot não tentar enviar de novo no minuto seguinte
+      await prisma.notification.create({
+        data: {
+          type: "MORNING_GAMES",
+          sentAt: new Date(),
+          groupId: BOLAO_GROUP_ID,
+        },
+      });
+
+      return; // Interrompe a função, não envia mensagem pro grupo
+    }
+    // ==========================================
+
     let message = `☀️ *BOM DIA, BOLEIROS!*\n\n`;
     message += `⚽ *JOGOS DA RODADA ${round}*\n\n`;
 
