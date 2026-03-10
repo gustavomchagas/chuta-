@@ -891,7 +891,7 @@
     data-bs-target="#palpites"
     type="button"
     role="tab"
-    onclick="carregarUsuarios(); carregarPalpites();"
+    onclick="carregarUsuarios(); carregarRodadasFiltro(); carregarPalpites();"
   >
     <i class="bi bi-search me-2"></i>Palpites
   </button>
@@ -1119,10 +1119,6 @@
                     <label class="form-label" style="color: var(--text-secondary)">Rodada</label>
                     <select id="roundFilterSelect" class="form-select" style="background: var(--bg-dark); color: var(--text-primary); border: 1px solid var(--border-color);">
                         <option value="">Todas</option>
-                        <option value="1">Rodada 1</option>
-                        <option value="2">Rodada 2</option>
-                        <option value="3">Rodada 3</option>
-                        <option value="4">Rodada 4</option>
                     </select>
                 </div>
                 <div class="col-md-3 d-flex align-items-end">
@@ -1614,6 +1610,25 @@
         console.error("Erro ao carregar lista de jogadores:", error);
     }
 }
+
+      async function carregarRodadasFiltro() {
+        const select = document.getElementById('roundFilterSelect');
+        // Se já tiver opções além de "Todas", não faz nada
+        if (select.options.length > 1) return;
+        try {
+          const response = await fetch('/api/rounds');
+          if (!response.ok) return;
+          const rounds = await response.json();
+          rounds.forEach(r => {
+            const option = document.createElement('option');
+            option.value = r.round;
+            option.innerText = `Rodada ${r.round}`;
+            select.appendChild(option);
+          });
+        } catch (error) {
+          console.error('Erro ao carregar rodadas:', error);
+        }
+      }
 
       async function carregarPalpites() {
     const userId = document.getElementById('userFilter').value;

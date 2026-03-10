@@ -6,7 +6,6 @@ Write-Host ""
 
 $plink = "$env:TEMP\plink.exe"
 $ppk = "C:\Users\Gustavo\Documents\.ssh\chutai-vps.ppk"
-$hostkey = "SHA256:rKV1icKuFRtnZH/5WZhMXv3SVpDy8C8kMezI7P/mQss"
 $server = "root@92.246.129.3"
 
 # Copiar .env.production para .env temporariamente
@@ -29,9 +28,9 @@ Write-Host "2. Criando tunel SSH para o banco de dados..." -ForegroundColor Yell
 
 # Iniciar tunel em background
 $tunnelJob = Start-Job -ScriptBlock {
-    param($plinkPath, $ppkPath, $hostkeyValue, $serverValue)
-    & $plinkPath -i $ppkPath -hostkey $hostkeyValue -L 5432:localhost:5432 -N $serverValue
-} -ArgumentList $plink, $ppk, $hostkey, $server
+    param($plinkPath, $ppkPath, $serverValue)
+    & $plinkPath -i $ppkPath -L 5432:localhost:5432 -N $serverValue
+} -ArgumentList $plink, $ppk, $server
 
 Write-Host "   Tunel criado! (Job ID: $($tunnelJob.Id))" -ForegroundColor Green
 

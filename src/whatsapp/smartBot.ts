@@ -548,14 +548,45 @@ async function handlePossibleBet(
     });
 
     if (!player) {
-      const pushName = msg.pushName || `Jogador ${senderPhone.slice(-4)}`;
-      player = await prisma.player.create({
-        data: {
-          phone: senderPhone,
-          name: pushName,
-        },
-      });
-      console.log(`👤 Novo jogador cadastrado: ${player.name}`);
+      // Não achou pelo telefone: tenta achar pelo nome (pushName normalizado)
+      // Isso lida com o caso em que o jogador foi cadastrado via terceiro (phone ext_)
+      // e agora está mandando do próprio número
+      const pushName = msg.pushName || ``;
+      // Normaliza: remove números e espaços do final (ex: "Flavio Almeida35987046021" → "Flavio Almeida")
+      const normalizedPushName = pushName.replace(/[\d\s]+$/, ``).trim();
+
+      if (normalizedPushName) {
+        const playerByName = await prisma.player.findFirst({
+          where: {
+            name: { equals: normalizedPushName, mode: `insensitive` },
+            phone: { startsWith: `ext_` },
+          },
+        });
+
+        if (playerByName) {
+          // Encontrou pelo nome (cadastrado por terceiro): vincula o telefone real
+          player = await prisma.player.update({
+            where: { id: playerByName.id },
+            data: { phone: senderPhone },
+          });
+          console.log(
+            `👤 Telefone vinculado ao jogador existente: ${player.name} (${senderPhone})`,
+          );
+        }
+      }
+
+      if (!player) {
+        // Não encontrou nenhum jogador compatível: cria novo
+        const newName =
+          normalizedPushName || `Jogador ${senderPhone.slice(-4)}`;
+        player = await prisma.player.create({
+          data: {
+            phone: senderPhone,
+            name: newName,
+          },
+        });
+        console.log(`👤 Novo jogador cadastrado: ${player.name}`);
+      }
     }
   }
 
@@ -636,8 +667,26 @@ async function handlePossibleBet(
       response += `⚠️ *Não registrados:*\n${errors.join("\n")}`;
     }
 
-    if (parseResult.suggestions.length > 0) {
-      response += `\n\n💡 ${parseResult.suggestions.join("\n")}`;
+    // Calcula os jogos que AINDA FALTAM no banco para este jogador
+    // (ignora o que falta na mensagem atual — o jogador pode ter palpitado antes)
+    const existingBetsForRound = await prisma.bet.findMany({
+      where: {
+        playerId: player.id,
+        matchId: { in: matches.map((m) => m.id) },
+      },
+      select: { matchId: true },
+    });
+    const bettedMatchIds = new Set(existingBetsForRound.map((b) => b.matchId));
+    const missingMatches = matches.filter((m) => !bettedMatchIds.has(m.id));
+
+    if (missingMatches.length > 0) {
+      const missingList = missingMatches
+        .map(
+          (m, i) =>
+            `${roundMatches.find((rm) => rm.id === m.id)?.number ?? i + 1}) ${m.homeTeam} x ${m.awayTeam}`,
+        )
+        .join(", ");
+      response += `\n\n💡 Faltou palpite para: ${missingList}`;
     }
 
     await sock.sendMessage(chatId, { text: response });
