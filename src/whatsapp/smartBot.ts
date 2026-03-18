@@ -1829,6 +1829,33 @@ async function sendReminderIfNeeded(force = false) {
     ? now.isSame(dayjs(firstMatchOfRound.matchDate), "day")
     : false;
 
+  // ==========================================
+  // NOVA LÓGICA DE BLOQUEIO (MENOS SPAM)
+  // ==========================================
+  // Regra 1: Só envia lembretes periódicos no PRIMEIRO dia da rodada
+  if (!isFirstDay && !force) {
+    console.log(
+      "🛑 Não é o primeiro dia da rodada - Pulando lembrete periódico.",
+    );
+    return;
+  }
+
+  // Regra 2: Cancela o lembrete se estiver muito perto (ou depois) do primeiro jogo
+  // Assim garantimos que o alerta de "1 hora antes" seja realmente a última mensagem!
+  if (firstMatchOfRound && !force) {
+    const matchTime = dayjs(firstMatchOfRound.matchDate);
+    const diffMinutes = matchTime.diff(now, "minute");
+
+    // Se faltam 65 minutos ou menos (ou se o jogo já começou, dando número negativo)
+    if (diffMinutes <= 65) {
+      console.log(
+        `🛑 Primeiro jogo muito próximo (${diffMinutes} min) ou já iniciado - Pulando lembrete.`,
+      );
+      return;
+    }
+  }
+  // ==========================================
+
   // Busca jogadores que ainda não palpitaram
   const pendingPlayers = await getPendingPlayers(allRoundMatches);
   const pendingCount = pendingPlayers.length;
@@ -2062,7 +2089,6 @@ async function sendMorningNotification() {
   }
 
   const roundNumbers = Array.from(matchesByRound.keys()).sort((a, b) => a - b);
-  const mainRound = roundNumbers[roundNumbers.length - 1]; // Última rodada (mais atual)
 
   // Verifica se já enviamos hoje (evita duplicatas)
   const alreadySent = await prisma.notification.findFirst({
@@ -2095,20 +2121,6 @@ async function sendMorningNotification() {
 
   // Se só há uma rodada, usa a lógica original
   const round = matchesToday[0].round;
-
-  // Busca jogos adiados que estão agendados para HOJE (têm a flag postponedFrom)
-  const postponedToday = await prisma.match.findMany({
-    where: {
-      matchDate: {
-        gte: todayStart,
-        lte: todayEnd,
-      },
-      postponedFrom: {
-        not: null,
-      },
-    },
-    orderBy: { matchDate: "asc" },
-  });
 
   // Busca o PRIMEIRO jogo da rodada (qualquer status, para calcular datas)
   const firstMatchOfRound = await prisma.match.findFirst({
@@ -2161,7 +2173,6 @@ async function sendMorningNotification() {
         await prisma.match.update({
           where: { id: postponed.id },
           data: {
-            // Adiciona flag para identificar jogo adiado posteriormente
             postponedFrom: `R${round}`,
           },
         });
@@ -2222,131 +2233,13 @@ async function sendMorningNotification() {
     // Envia segunda mensagem com lista para copiar
     await sock.sendMessage(BOLAO_GROUP_ID, { text: copyMessage });
   } else {
-    // Se NÃO for o primeiro dia, envia jogos PENDENTES da rodada
-    console.log("📅 Não é o primeiro dia - enviando jogos pendentes da rodada");
-
-    // Busca TODOS os jogos SCHEDULED da rodada
-    const allRoundMatches = await prisma.match.findMany({
-      where: {
-        round: round,
-        status: "SCHEDULED",
-      },
-      orderBy: { matchDate: "asc" },
-    });
-
-    // Filtra adiados (primeiro jogo + 2 dias)
-    const maxDate = firstMatchDate.add(2, "day").endOf("day");
-    const validMatches = allRoundMatches.filter(
-      (match) =>
-        dayjs(match.matchDate).isBefore(maxDate) ||
-        dayjs(match.matchDate).isSame(maxDate, "day"),
+    // Se NÃO for o primeiro dia, silencia a notificação para não poluir o grupo!
+    console.log(
+      "🛑 Não é o primeiro dia da rodada - Pulando notificação matinal (modo silencioso).",
     );
-
-    // Filtra jogos que ainda NÃO começaram (futuro)
-    const now = dayjs();
-    const pendingMatches = validMatches.filter((match) =>
-      dayjs(match.matchDate).isAfter(now),
-    );
-
-    // Busca jogos SCHEDULED de hoje não incluídos em pendingMatches
-    // (inclui reagendados mesmo sem a flag postponedFrom definida)
-    const pendingMatchIds = new Set(pendingMatches.map((m) => m.id));
-    const extraMatchesToday = await prisma.match.findMany({
-      where: {
-        matchDate: {
-          gte: todayStart,
-          lte: todayEnd,
-        },
-        status: "SCHEDULED",
-        id: { notIn: Array.from(pendingMatchIds) },
-      },
-      orderBy: { matchDate: "asc" },
-    });
-
-    // Combina jogos normais com jogos extras de hoje
-    const allMatchesToNotify = [...pendingMatches];
-    if (extraMatchesToday.length > 0) {
-      allMatchesToNotify.push(...extraMatchesToday);
-      console.log(
-        `📌 Incluindo ${extraMatchesToday.length} jogo(s) extra(s) de hoje na notificação`,
-      );
-    }
-
-    if (allMatchesToNotify.length === 0) {
-      console.log("📭 Sem jogos pendentes na rodada");
-      return;
-    }
-
-    // ==========================================
-    // NOVA LÓGICA: Verifica se ainda faltam palpites
-    // ==========================================
-    const pendingPlayers = await getPendingPlayers(allMatchesToNotify);
-
-    if (pendingPlayers.length === 0) {
-      console.log(
-        "✅ Todos os membros já palpitaram! Pulando notificação matinal do dia seguinte.",
-      );
-
-      // Precisamos registrar que a notificação foi "processada" no banco
-      // para o bot não tentar enviar de novo no minuto seguinte
-      await prisma.notification.create({
-        data: {
-          type: "MORNING_GAMES",
-          sentAt: new Date(),
-          groupId: BOLAO_GROUP_ID,
-        },
-      });
-
-      return; // Interrompe a função, não envia mensagem pro grupo
-    }
-    // ==========================================
-
-    let message = `☀️ *BOM DIA, BOLEIROS!*\n\n`;
-    message += `⚽ *JOGOS DA RODADA ${round}*\n\n`;
-
-    // Agrupa por data
-    const byDateNotify = new Map<string, typeof allMatchesToNotify>();
-    for (const match of allMatchesToNotify) {
-      const dateKey = dayjs(match.matchDate).format("YYYY-MM-DD");
-      if (!byDateNotify.has(dateKey)) byDateNotify.set(dateKey, []);
-      byDateNotify.get(dateKey)!.push(match);
-    }
-
-    for (const [dateKey, dateMatches] of byDateNotify) {
-      const dateLabel = dayjs(dateKey).format("DD/MM (dddd)");
-      message += `📅 *${dateLabel}*\n`;
-      for (const match of dateMatches) {
-        const isPostponed =
-          extraMatchesToday.some((p) => p.id === match.id) ||
-          match.postponedFrom !== null;
-        const postponedNote = isPostponed
-          ? ` _(Jogo adiado da rodada ${match.postponedFrom ? match.postponedFrom.replace("R", "") : String(match.round)})_`
-          : "";
-        const time = dayjs(match.matchDate).format("HH[h]mm");
-        message += `🏟️ ${match.homeTeam} x ${match.awayTeam} (${time})${postponedNote}\n`;
-      }
-      message += `\n`;
-    }
-
-    message += `\n📝 *Quem ainda não palpitou, corre que dá tempo!*\n`;
-    message += `_Lembrando: palpite só vale se enviado ANTES do jogo começar!_\n\n`;
-    message += `⚠️ *ATENÇÃO: Uma vez enviado, o palpite NÃO PODE ser alterado!*\n`;
-    message += `_Confira bem antes de enviar._`;
-
-    // Envia primeira mensagem
-    await sock.sendMessage(BOLAO_GROUP_ID, { text: message });
-
-    // Monta e envia segunda mensagem com lista para copiar (inclui jogos adiados)
-    let copyMessage = ``;
-    for (const match of allMatchesToNotify) {
-      copyMessage += `${match.homeTeam} x ${match.awayTeam}\n`;
-    }
-    copyMessage += `\n💡 _Copie, altere os placares e envie aqui!_`;
-
-    await sock.sendMessage(BOLAO_GROUP_ID, { text: copyMessage });
   }
 
-  // Registra que enviamos a notificação
+  // Registra que enviamos a notificação (mesmo silenciosa) para ele não tentar enviar de novo!
   await prisma.notification.create({
     data: {
       type: "MORNING_GAMES",
@@ -2355,7 +2248,7 @@ async function sendMorningNotification() {
     },
   });
 
-  console.log(`✅ Notificação matinal enviada para ${BOLAO_GROUP_ID}`);
+  console.log(`✅ Notificação matinal processada para ${BOLAO_GROUP_ID}`);
 }
 
 /**
